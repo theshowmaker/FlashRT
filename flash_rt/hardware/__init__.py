@@ -36,6 +36,7 @@ def detect_arch() -> str:
         ``"thor"``      — Jetson AGX Thor, SM110 (cc 11.0)
         ``"rtx_sm120"`` — RTX 5090 / Blackwell consumer, SM120 (cc 12.0)
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
+        ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
 
     Raises RuntimeError if CUDA is unavailable or the card has an
     unsupported SM level. Deliberately strict: silently falling back to
@@ -55,12 +56,14 @@ def detect_arch() -> str:
         return "thor"
     if (major, minor) == (12, 0):
         return "rtx_sm120"
+    if (major, minor) == (8, 7):
+        return "rtx_sm87"
     if (major, minor) == (8, 9):
         return "rtx_sm89"
     raise RuntimeError(
         f"FlashRT: unsupported GPU SM {major}.{minor}. "
         f"Supported architectures: SM110 (Thor), SM120 (RTX 5090), "
-        f"SM89 (RTX 4090)."
+        f"SM89 (RTX 4090), SM87 (Jetson Orin experimental)."
     )
 
 
@@ -73,6 +76,8 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("pi05", "torch", "thor"):
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
     ("pi05", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    ("pi05", "torch", "rtx_sm87"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
@@ -122,6 +127,12 @@ def resolve_pipeline_class(config: str, framework: str, arch: str):
     does not pull in torch/jax/rtx code until a load happens.
     """
     key = (config, framework, arch)
+    if arch == "rtx_sm87" and key != ("pi05", "torch", "rtx_sm87"):
+        raise RuntimeError(
+            "FlashRT: Jetson Orin SM87 currently supports only "
+            "config='pi05' with framework='torch'. "
+            f"config={config!r} framework={framework!r} is not supported yet."
+        )
     if key not in _PIPELINE_MAP:
         supported = sorted(
             (c, f, a) for (c, f, a) in _PIPELINE_MAP

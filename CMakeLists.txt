@@ -69,18 +69,37 @@ endif()
 message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 
 # Flash-Attention 2 vendor (csrc/attention/flash_attn_2_src/): ships
-# SM80-family fp16 fwd kernels. SM89 (4090) runs sm_80 SASS natively
-# via Ampere ISA compatibility; SM120 (5090) uses PTX JIT from
+# SM80-family fp16 fwd kernels. Ampere-family consumer GPUs including
+# SM86/87/89 share the same source instantiations; we emit arch-specific
+# codegen per target so Jetson Orin (SM87) is not forced through an
+# incompatible cubin. SM120 (5090) uses PTX JIT from
 # compute_80. Thor SM110 has its own attention path (fvk.attention_qkv_fp16
 # cuBLAS decomposed), hand-tuned for unified LPDDR memory — building
 # FA2 there would add ~10 MB to the .so and unused compile time.
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
+   GPU_ARCH STREQUAL "87"  OR
    GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120")
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
 else()
   set(ENABLE_FA2 OFF)
   message(STATUS "FA2 in-SO attention: DISABLED (Thor SM110 uses fvk.attention_qkv_fp16 cuBLAS path)")
+endif()
+
+# SM80-family CUTLASS INT8 kernels used by the Jetson Orin SM87 Pi0.5 fast
+# path. Keep them out of the shared flash_rt_kernels module on other targets
+# so Thor/RTX builds do not inherit unrelated compile/link risk.
+if(NOT DEFINED ENABLE_SM80_INT8_CUTLASS)
+  if(GPU_ARCH STREQUAL "87")
+    set(ENABLE_SM80_INT8_CUTLASS ON)
+  else()
+    set(ENABLE_SM80_INT8_CUTLASS OFF)
+  endif()
+endif()
+if(ENABLE_SM80_INT8_CUTLASS)
+  message(STATUS "SM80-family CUTLASS INT8: ENABLED (sm_${GPU_ARCH})")
+else()
+  message(STATUS "SM80-family CUTLASS INT8: DISABLED (current: sm_${GPU_ARCH})")
 endif()
 
 # ── FA2 build slimming flags (opt-in; defaults keep today's behaviour) ──
@@ -417,7 +436,8 @@ if(ENABLE_FA2)
     # Just emit native SASS for the detected GPU. Use the real arch
     # (compute_80 for SM80/86/89 since they share Ampere ISA; direct
     # compute_120 for SM120). Matches upstream FA2 setup.py behaviour.
-    if(GPU_ARCH STREQUAL "80" OR GPU_ARCH STREQUAL "86" OR GPU_ARCH STREQUAL "89")
+    if(GPU_ARCH STREQUAL "80" OR GPU_ARCH STREQUAL "86" OR
+       GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
       target_compile_options(fa2_vendor_obj PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:
           "SHELL:-gencode arch=compute_80,code=sm_${GPU_ARCH}"
@@ -534,6 +554,14 @@ endif()
 if(ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:gemm_kernels_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_NVFP4=1)
+endif()
+
+if(ENABLE_SM80_INT8_CUTLASS)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/gemm/cutlass_sm80_int8_rowwise.cu
+    csrc/gemm/cutlass_sm80_int8_rowwise_t64x128.cu
+    csrc/gemm/cutlass_sm80_int8_silu_gated.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM80_INT8_CUTLASS=1)
 endif()
 
 # SM120a CUTLASS block-128 FP8 GEMM (Path B for Qwen3.6).

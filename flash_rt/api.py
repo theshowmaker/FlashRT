@@ -180,6 +180,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_awq=None,
                awq_alpha=0.5,
                use_p1_split_gu=None,
+               num_steps=None,
+               vision_pool_factor=None,
+               vision_num_layers=None,
+               cache_frames=None,
                use_fp8=True):
     """Load a FlashRT model.
 
@@ -214,7 +218,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                                       those classes have SM120 runtime forks
                                       where needed, e.g. Pi0-FAST.)
               SM89  (RTX 4090)     → ``flash_rt.hardware.rtx.*``
-            Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` explicitly to
+              SM87  (Jetson Orin)  → ``flash_rt.hardware.rtx.*`` (experimental,
+                                     Pi0.5 torch only; BF16 default, INT8
+                                     via Orin env flags)
+            Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
+            ``"rtx_sm87"`` explicitly to
             force a specific backend (useful for cross-hardware debugging).
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
             ``None`` uses the backend default (``"new_embodiment"`` — unfit
@@ -238,6 +246,18 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
+        num_steps: Pi0/Pi0.5 torch only when supported. Number of
+            flow-matching ODE steps. ``None`` uses the frontend default.
+        vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
+            for vision tokens; valid values are 1, 2, or 4. ``None`` keeps
+            the frontend default.
+        vision_num_layers: Pi0.5 torch RTX/Orin only. Number of SigLIP vision
+            layers to execute; valid range is 1-27. ``None`` keeps the
+            frontend default.
+        cache_frames: Pi0.5 torch RTX/Orin only. Temporal K/V reuse period.
+            1 runs the full vision+encoder+decoder path on every frame; 2
+            alternates full and decoder-only frames. ``None`` keeps the
+            frontend default.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -362,6 +382,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["autotune"] = autotune
         if "weight_cache" in sig.parameters:
             kwargs["weight_cache"] = weight_cache
+        # Orin-specific performance parameters (passed only when accepted and set).
+        if num_steps is not None and "num_steps" in sig.parameters:
+            kwargs["num_steps"] = num_steps
+        if vision_pool_factor is not None and "vision_pool_factor" in sig.parameters:
+            kwargs["vision_pool_factor"] = vision_pool_factor
+        if vision_num_layers is not None and "vision_num_layers" in sig.parameters:
+            kwargs["vision_num_layers"] = vision_num_layers
+        if cache_frames is not None and "cache_frames" in sig.parameters:
+            kwargs["cache_frames"] = cache_frames
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:
