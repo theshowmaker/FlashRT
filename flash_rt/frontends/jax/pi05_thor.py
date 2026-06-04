@@ -132,10 +132,14 @@ class Pi05JaxFrontendThor:
             cached = load_weight_cache(str(checkpoint_dir), num_views)
             if cached is not None:
                 cached_sa = self._cache_chunk_size(cached)
+                cached_has_exist = self._cache_has_exist_marker(cached)
                 if cached_sa is not None and cached_sa != self._requested_chunk_size:
                     logger.info(
                         "Ignoring weight cache with Sa=%s; requested chunk_size=%s",
                         cached_sa, self._requested_chunk_size)
+                elif cached_has_exist is None:
+                    logger.info(
+                        "Ignoring legacy weight cache without exist_head metadata")
                 else:
                     self._load_from_cache(cached)
                     cache_hit = True
@@ -367,6 +371,17 @@ class Pi05JaxFrontendThor:
 
         # Embedding: keep as numpy for _embed_prompt
         self._embedding_np = engine_w["encoder.embedding"].astype(fp16)
+        self._exist_head_w_np = engine_w.get(
+            "exist_head.weight", np.empty((0,), dtype=np.float32)
+        ).astype(np.float32)
+        self._exist_head_b_np = engine_w.get(
+            "exist_head.bias", np.empty((0,), dtype=np.float32)
+        ).astype(np.float32)
+        self._has_exist_head = (
+            self._exist_head_w_np.size > 0 and self._exist_head_b_np.size > 0
+        )
+        if self._has_exist_head:
+            logger.info("Loaded optional Pi0.5 exist_head")
 
         _ainw = engine_w["action.in_proj.weight"].astype(fp16)
         _ainb = engine_w["action.in_proj.bias"].astype(fp16)
@@ -461,7 +476,7 @@ class Pi05JaxFrontendThor:
     _CACHE_NUMPY = [
         "_embedding_np", "_time_mlp_in_w", "_time_mlp_in_b",
         "_time_mlp_out_w", "_time_mlp_out_b", "_final_mod_w", "_final_mod_b",
-        "_time_emb_np", "_kc_t", "_ks_t",
+        "_time_emb_np", "_kc_t", "_ks_t", "_exist_head_w_np", "_exist_head_b_np",
     ]
     # Per-layer numpy lists
     _CACHE_NUMPY_LISTS = [
@@ -520,7 +535,8 @@ class Pi05JaxFrontendThor:
         dims = {"sig_dims": list(self.sig_dims), "Se_max": self.Se_max,
                 "De": self.De, "He": self.He, "Le": self.Le,
                 "NHe": self.NHe, "HDe": self.HDe,
-                "Sa": self.Sa, "Da": self.Da, "Ha": self.Ha, "La": self.La}
+                "Sa": self.Sa, "Da": self.Da, "Ha": self.Ha, "La": self.La,
+                "has_exist_head": bool(getattr(self, "_has_exist_head", False))}
         dims_json = json.dumps(dims).encode("utf-8")
         entries.append({"name": "_dims", "dtype": "json", "shape": [len(dims_json)]})
         blobs.append(dims_json)
@@ -585,6 +601,12 @@ class Pi05JaxFrontendThor:
         # Numpy arrays
         for attr in self._CACHE_NUMPY:
             setattr(self, attr, _get_numpy(attr))
+        self._has_exist_head = (
+            getattr(self, "_exist_head_w_np", np.empty((0,))).size > 0
+            and getattr(self, "_exist_head_b_np", np.empty((0,))).size > 0
+        )
+        if self._has_exist_head:
+            logger.info("Loaded optional Pi0.5 exist_head from cache")
 
         # Per-layer numpy lists
         for attr in self._CACHE_NUMPY_LISTS:
@@ -658,8 +680,7 @@ class Pi05JaxFrontendThor:
         logger.info("Weights restored from cache")
 
     @staticmethod
-    def _cache_chunk_size(cached):
-        """Return cached action chunk length without restoring GPU buffers."""
+    def _cache_dims(cached):
         header, body = cached
         for entry in header.get("entries", []):
             if entry.get("name") != "_dims":
@@ -667,11 +688,26 @@ class Pi05JaxFrontendThor:
             start = int(entry["offset"])
             end = start + int(entry["nbytes"])
             try:
-                dims = json.loads(body[start:end].decode("utf-8"))
+                return json.loads(body[start:end].decode("utf-8"))
             except Exception:
                 return None
-            return int(dims.get("Sa", 0)) or None
         return None
+
+    @staticmethod
+    def _cache_chunk_size(cached):
+        """Return cached action chunk length without restoring GPU buffers."""
+        dims = Pi05JaxFrontendThor._cache_dims(cached)
+        if not dims:
+            return None
+        return int(dims.get("Sa", 0)) or None
+
+    @staticmethod
+    def _cache_has_exist_marker(cached):
+        """Return cached exist-head marker, or None for legacy caches."""
+        dims = Pi05JaxFrontendThor._cache_dims(cached)
+        if not dims or "has_exist_head" not in dims:
+            return None
+        return bool(dims.get("has_exist_head"))
 
     def set_prompt(self, prompt_text):
         """Set prompt: tokenize, time conditioning (numpy), RoPE, calibrate, capture graph.
@@ -2532,6 +2568,22 @@ class Pi05JaxFrontendThor:
 
         logger.info("Autotune done: Enc+AE = %.2f ms (best of %d)", p50, n_trials)
 
+    def _finish_exist_head(self):
+        if not getattr(self, "_has_exist_head", False):
+            return {}
+        prefix_out = self.enc_x.download_new((self.Se, self.De), np.float16).astype(np.float32)
+        pooled = prefix_out.mean(axis=0)
+        w = self._exist_head_w_np.astype(np.float32, copy=False)
+        b = self._exist_head_b_np.astype(np.float32, copy=False)
+        if w.ndim == 2 and w.shape[0] != self.De and w.shape[1] == self.De:
+            w = w.T
+        logit = float((pooled @ w).reshape(-1)[0] + b.reshape(-1)[0])
+        prob = np.float32(1.0 / (1.0 + np.exp(-logit)))
+        return {
+            "exist": np.asarray(int(prob > 0.5), dtype=np.int32),
+            "exist_prob": np.asarray(prob, dtype=np.float32),
+        }
+
     def infer(self, observation, debug=False):
         """Run inference: upload image → CUDA Graph replay (patch_embed in graph)."""
         if self._rl_config is not None:
@@ -2570,9 +2622,12 @@ class Pi05JaxFrontendThor:
 
         self.enc_ae_graph.replay(self._stream)
         self._cudart.cudaStreamSynchronize(self._stream)
+        exist_result = self._finish_exist_head()
 
         # Output
         raw_actions = self.g_noise.download_new((self.Sa, 32), np.float16).astype(np.float32)
+        if "exist" in exist_result and int(np.asarray(exist_result["exist"])) == 0:
+            raw_actions.fill(0.0)
 
         if self.norm_stats:
             from flash_rt.core.utils.actions import unnormalize_actions
@@ -2585,4 +2640,6 @@ class Pi05JaxFrontendThor:
         if debug:
             logger.info(f"JAX infer: {latency:.1f} ms")
 
-        return {"actions": robot_actions}
+        result = {"actions": robot_actions}
+        result.update(exist_result)
+        return result

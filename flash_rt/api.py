@@ -39,6 +39,7 @@ class VLAModel:
         self._framework = framework
         self._current_prompt = None
         self._current_prompt_state = None
+        self._last_result = None
         # rtx Pi0.5 (RtxTorchPi05) requires an explicit
         # ``calibrate_with_real_data([obs])`` call before the first
         # ``infer()``; Thor / rtx GROOT lazy-calibrate inside ``infer()``.
@@ -144,7 +145,13 @@ class VLAModel:
             self._needs_real_data_calibration = False
 
         result = self._pipe.infer(obs)
+        self._last_result = result
         return result['actions']
+
+    @property
+    def last_result(self):
+        """Full result dict returned by the frontend during the last predict()."""
+        return self._last_result
 
     def warm_state_prompt_buckets(self, images, prompt, states):
         """Pre-build Pi0.5 state-prompt runtime buckets.

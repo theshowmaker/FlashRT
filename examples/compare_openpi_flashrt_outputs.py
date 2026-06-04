@@ -22,12 +22,13 @@ import websockets.sync.client
 
 def _pack_array(obj):
     if isinstance(obj, np.ndarray):
+        shape = obj.shape
         arr = np.ascontiguousarray(obj)
         return {
             b"__ndarray__": True,
             b"data": arr.tobytes(),
             b"dtype": arr.dtype.str,
-            b"shape": arr.shape,
+            b"shape": shape,
         }
     if isinstance(obj, np.generic):
         return {
@@ -111,6 +112,15 @@ def _actions(out: dict) -> np.ndarray:
     raise KeyError(f"response has no actions/action key: {list(out.keys())}")
 
 
+def _maybe_exist(out: dict):
+    if "exist" not in out:
+        return None
+    arr = np.asarray(out["exist"], dtype=np.int32)
+    if arr.size == 1:
+        return arr.reshape(())
+    return arr
+
+
 def _stats(name: str, arr: np.ndarray) -> str:
     finite = bool(np.isfinite(arr).all())
     return (
@@ -164,6 +174,8 @@ def main() -> int:
     openpi_actions = []
     flashrt_actions = []
     last_obs = base_obs
+    openpi_exist = []
+    flashrt_exist = []
 
     for i in range(args.steps):
         obs = base_obs if args.fixed_obs else (
@@ -181,17 +193,34 @@ def main() -> int:
         openpi_actions.append(act_a)
         flashrt_actions.append(act_b)
         cmp = _compare(act_a, act_b)
-        print(f"[{i:03d}] openpi={t_a:.2f} ms flashrt={t_b:.2f} ms compare={cmp}")
+        exist_a = _maybe_exist(out_a)
+        exist_b = _maybe_exist(out_b)
+        exist_msg = ""
+        if exist_a is not None or exist_b is not None:
+            openpi_exist.append(exist_a)
+            flashrt_exist.append(exist_b)
+            exist_msg = f" exist_openpi={exist_a} exist_flashrt={exist_b}"
+        print(f"[{i:03d}] openpi={t_a:.2f} ms flashrt={t_b:.2f} ms compare={cmp}{exist_msg}")
 
     a = np.stack(openpi_actions)
     b = np.stack(flashrt_actions)
     print(_stats("openpi actions", a))
     print(_stats("flashrt actions", b))
     print(f"aggregate compare: {_compare(a, b)}")
+    if openpi_exist or flashrt_exist:
+        print(f"openpi exist:  {openpi_exist}")
+        print(f"flashrt exist: {flashrt_exist}")
 
     if args.save:
         args.save.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(args.save, openpi_actions=a, flashrt_actions=b, obs=np.array(last_obs, dtype=object))
+        np.savez_compressed(
+            args.save,
+            openpi_actions=a,
+            flashrt_actions=b,
+            openpi_exist=np.array(openpi_exist, dtype=object),
+            flashrt_exist=np.array(flashrt_exist, dtype=object),
+            obs=np.array(last_obs, dtype=object),
+        )
         print(f"saved: {args.save}")
 
     openpi.close()

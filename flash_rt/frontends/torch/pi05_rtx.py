@@ -103,13 +103,17 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     f = safe_open(str(safetensors_path), framework="pt")
     # Auto-strip the lerobot HF policy ``model.`` wrap so the openpi
     # bare-key lookups below resolve transparently on either layout.
-    _strip = _autodetect_strip_prefix(set(f.keys()))
+    _all_keys = set(f.keys())
+    _strip = _autodetect_strip_prefix(_all_keys)
 
     def g(key: str) -> torch.Tensor:
         return f.get_tensor((_strip + key) if _strip else key).to(bf16)
 
     def g_raw(key: str) -> torch.Tensor:
         return f.get_tensor((_strip + key) if _strip else key)
+
+    def has(key: str) -> bool:
+        return ((_strip + key) if _strip else key) in _all_keys
 
     ckpt: dict = {}
 
@@ -286,6 +290,13 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     ckpt["decoder_action_in_proj_b"] = g("action_in_proj.bias")
     ckpt["decoder_action_out_proj_w"] = g("action_out_proj.weight").t()
     ckpt["decoder_action_out_proj_b"] = g("action_out_proj.bias")
+
+    # ── Optional H10W/OpenPI existence head ──
+    # OpenPI's custom Pi0.5 can attach ``exist_head`` to the pooled prefix
+    # output. Keep it optional so vanilla Pi0.5 checkpoints still load.
+    if has("exist_head.weight") and has("exist_head.bias"):
+        ckpt["exist_head_w"] = g("exist_head.weight").t().contiguous()
+        ckpt["exist_head_b"] = g("exist_head.bias").contiguous()
 
     # ── Embedding matrix (for prompt tokenisation) ──
     ckpt["embedding_weight"] = g("paligemma_with_expert.paligemma.lm_head.weight")
@@ -568,6 +579,15 @@ class Pi05TorchFrontendRtx:
             else:
                 self._ckpt_bf16[k] = v
         self.embedding_weight = self._ckpt_bf16["embedding_weight"]
+        self._exist_head_w = self._ckpt_bf16.get("exist_head_w")
+        self._exist_head_b = self._ckpt_bf16.get("exist_head_b")
+        self._exist_encoder_out: Optional[torch.Tensor] = None
+        self._has_exist_head = (
+            isinstance(self._exist_head_w, torch.Tensor)
+            and isinstance(self._exist_head_b, torch.Tensor)
+        )
+        if self._has_exist_head:
+            logger.info("Loaded optional Pi0.5 exist_head")
 
         # Pre-scale decoder action output projection by -1/num_steps.
         # Scaling is specific to the step count (ODE integration step size).
@@ -1470,6 +1490,47 @@ class Pi05TorchFrontendRtx:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
+    def _stage_exist_prefix_out(self, stream_int: int) -> Optional[torch.Tensor]:
+        """Copy encoder prefix output for the optional OpenPI exist head."""
+        if not self._has_exist_head or self.pipeline is None:
+            return None
+        seq = int(self.pipeline.vision_seq_enc + self.current_prompt_len)
+        if seq <= 0:
+            return None
+        if (self._exist_encoder_out is None
+                or self._exist_encoder_out.shape != (seq, ENC_D)):
+            self._exist_encoder_out = torch.empty(
+                seq, ENC_D, dtype=bf16, device="cuda")
+        self._cudart.cudaMemcpyAsync(
+            ctypes.c_void_p(self._exist_encoder_out.data_ptr()),
+            ctypes.c_void_p(self.pipeline.bufs["encoder_x"].ptr.value),
+            self._exist_encoder_out.numel() * 2,
+            3,
+            stream_int,
+        )
+        return self._exist_encoder_out
+
+    def _finish_exist_head(
+        self,
+        prefix_out: Optional[torch.Tensor],
+    ) -> dict[str, np.ndarray]:
+        """Compute OpenPI's optional ``exist_head(mean(prefix_out))``."""
+        if prefix_out is None or not self._has_exist_head:
+            return {}
+        with torch.no_grad():
+            pooled = prefix_out.float().mean(dim=0)
+            w = self._exist_head_w
+            b = self._exist_head_b
+            if w.ndim == 2 and w.shape[0] != ENC_D and w.shape[1] == ENC_D:
+                w = w.t()
+            logit = (pooled @ w.float()).reshape(-1)[0] + b.float().reshape(-1)[0]
+            prob = torch.sigmoid(logit)
+            pred = (prob > 0.5).to(torch.int32)
+        return {
+            "exist": pred.cpu().numpy().reshape(()),
+            "exist_prob": prob.cpu().numpy().astype(np.float32),
+        }
+
     def infer(self, observation: dict, debug: bool = False) -> dict:
         """Run inference on a single observation.
 
@@ -1522,6 +1583,7 @@ class Pi05TorchFrontendRtx:
                 ctypes.c_void_p(self._noise_out.data_ptr()),
                 ctypes.c_void_p(out_ptr),
                 self._noise_out.numel() * 2, 3, stream_int)
+            exist_prefix_out = self._stage_exist_prefix_out(stream_int)
 
         self._cudart.cudaStreamSynchronize(
             ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
@@ -1529,7 +1591,10 @@ class Pi05TorchFrontendRtx:
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
 
+        exist_result = self._finish_exist_head(exist_prefix_out)
         raw_actions = self._noise_out.float().cpu().numpy()  # (chunk, 32)
+        if "exist" in exist_result and int(np.asarray(exist_result["exist"])) == 0:
+            raw_actions.fill(0.0)
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
         robot_actions = unnorm[:, :self.action_dim]
 
@@ -1537,7 +1602,9 @@ class Pi05TorchFrontendRtx:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        result = {"actions": robot_actions}
+        result.update(exist_result)
+        return result
 
     def _infer_cfg_batched(self, observation: dict,
                            debug: bool = False) -> dict:

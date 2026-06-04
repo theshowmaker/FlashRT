@@ -38,12 +38,13 @@ def _pack_array(obj):
     if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
         raise ValueError(f"Unsupported dtype: {obj.dtype}")
     if isinstance(obj, np.ndarray):
+        shape = obj.shape
         arr = np.ascontiguousarray(obj)
         return {
             b"__ndarray__": True,
             b"data": arr.tobytes(),
             b"dtype": arr.dtype.str,
-            b"shape": arr.shape,
+            b"shape": shape,
         }
     if isinstance(obj, np.generic):
         return {
@@ -64,6 +65,10 @@ def _unpack_array(obj):
     if b"__npgeneric__" in obj:
         return np.dtype(obj[b"dtype"]).type(obj[b"data"])
     return obj
+
+
+def _numpy_scalar(value, dtype):
+    return np.asarray(value, dtype=dtype).reshape(())
 
 
 def packb(obj: Any) -> bytes:
@@ -290,11 +295,12 @@ class FlashRTPi05Policy:
 
         infer_t0 = time.perf_counter()
         actions = self.model.predict(images=images, prompt=prompt, state=state)
+        model_result = getattr(self.model, "last_result", None) or {}
         if state is not None and not self.args.no_h10w_dual_absolute_actions:
             actions = _h10w_dual_absolute_actions(actions, state)
         infer_ms = (time.perf_counter() - infer_t0) * 1000
 
-        return {
+        response = {
             "actions": actions,
             "action": actions,
             "policy_timing": {
@@ -302,6 +308,11 @@ class FlashRTPi05Policy:
                 "predict_ms": infer_ms,
             },
         }
+        if "exist" in model_result:
+            response["exist"] = _numpy_scalar(model_result["exist"], np.int32)
+        if "exist_prob" in model_result:
+            response["exist_prob"] = _numpy_scalar(model_result["exist_prob"], np.float32)
+        return response
 
 
 async def _handler(websocket, policy: FlashRTPi05Policy, api_key: str | None):

@@ -397,6 +397,13 @@ def convert_pi05_orbax(
     ckpt["decoder_action_out_proj_w"] = _to_bf16_cuda(raw["action_out_proj.kernel"])
     ckpt["decoder_action_out_proj_b"] = _to_bf16_cuda(raw["action_out_proj.bias"])
 
+    # ── Optional H10W/OpenPI existence head ──
+    # NNX stores Linear kernels as (in, out), which is exactly what the
+    # lightweight torch-side matmul below expects.
+    if "exist_head.kernel" in raw and "exist_head.bias" in raw:
+        ckpt["exist_head_w"] = _to_bf16_cuda(raw["exist_head.kernel"])
+        ckpt["exist_head_b"] = _to_bf16_cuda(raw["exist_head.bias"])
+
     # ── Embedding matrix (for prompt tokenisation) ──
     # JAX stores the input embedding under PaliGemma.llm.embedder, the lm_head
     # is tied to it. For prompt embedding we use the input embedder.
@@ -516,6 +523,15 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
             for k, v in raw_ckpt.items()
         }
         self.embedding_weight = self._ckpt_bf16["embedding_weight"]
+        self._exist_head_w = self._ckpt_bf16.get("exist_head_w")
+        self._exist_head_b = self._ckpt_bf16.get("exist_head_b")
+        self._exist_encoder_out: Optional[torch.Tensor] = None
+        self._has_exist_head = (
+            isinstance(self._exist_head_w, torch.Tensor)
+            and isinstance(self._exist_head_b, torch.Tensor)
+        )
+        if self._has_exist_head:
+            logger.info("Loaded optional Pi0.5 exist_head")
 
         # Pre-scale decoder action output projection by -1/num_steps
         # (matches the torch frontend's pre-scaling step that bakes the

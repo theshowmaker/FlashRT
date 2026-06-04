@@ -205,6 +205,9 @@ def transform_jax_weights(raw: dict) -> dict:
 
     # ── Encoder (Gemma 2B, 18 layers) ──
     out["encoder.embedding"] = raw["PaliGemma.llm.embedder.input_embedding"].astype(np.float16)
+    if "exist_head.kernel" in raw and "exist_head.bias" in raw:
+        out["exist_head.weight"] = raw["exist_head.kernel"].astype(np.float32)
+        out["exist_head.bias"] = raw["exist_head.bias"].astype(np.float32)
 
     for i in range(18):
         pfx = f"encoder.layer.{i}"
