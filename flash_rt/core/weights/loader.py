@@ -134,20 +134,40 @@ def _load_orbax(path: str) -> Dict[str, np.ndarray]:
         mesh = jax.sharding.Mesh(jax.devices(), ("x",))
         sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-        with ocp.PyTreeCheckpointer() as ckptr:
-            metadata = ckptr.metadata(str(params_path))
-            item = {"params": metadata["params"]}
-            params = ckptr.restore(
-                str(params_path),
-                ocp.args.PyTreeRestore(
-                    item=item,
-                    restore_args=jax.tree.map(
-                        lambda _: ocp.ArrayRestoreArgs(
-                            sharding=sharding, restore_type=np.ndarray
-                        ), item
+        try:
+            with ocp.PyTreeCheckpointer() as ckptr:
+                metadata = ckptr.metadata(str(params_path))
+                if isinstance(metadata, dict):
+                    item = {"params": metadata["params"]}
+                elif hasattr(metadata, "item_metadata"):
+                    item = {"params": metadata.item_metadata["params"]}
+                else:
+                    raise TypeError(
+                        f"Unsupported Orbax metadata type: {type(metadata)!r}")
+                params = ckptr.restore(
+                    str(params_path),
+                    ocp.args.PyTreeRestore(
+                        item=item,
+                        restore_args=jax.tree.map(
+                            lambda _: ocp.ArrayRestoreArgs(
+                                sharding=sharding, restore_type=np.ndarray
+                            ), item
+                        ),
                     ),
-                ),
-            )["params"]
+                )["params"]
+        except (TypeError, AttributeError, KeyError):
+            logger.info(
+                "Orbax PyTree metadata restore was incompatible with this "
+                "orbax-checkpoint version; falling back to StandardCheckpointer.")
+            with ocp.StandardCheckpointer() as ckptr:
+                restored = ckptr.restore(
+                    str(params_path),
+                    target=None,
+                    strict=False,
+                )
+            params = restored["params"] if (
+                isinstance(restored, dict) and "params" in restored
+            ) else restored
 
         import flax.traverse_util as tu
         flat = tu.flatten_dict(params, sep=".")

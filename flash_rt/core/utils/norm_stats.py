@@ -345,9 +345,13 @@ def pi05_candidates(checkpoint_dir: pathlib.Path) -> list[pathlib.Path]:
     of ``assets/physical-intelligence/libero``.
     """
     home = pathlib.Path.home()
+    custom_asset_stats = sorted(
+        (checkpoint_dir / "assets").glob("*/norm_stats.json")
+    )
     return [
         checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
         checkpoint_dir / "assets" / "droid" / "norm_stats.json",
+        *custom_asset_stats,
         checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
         checkpoint_dir.parent / "pi05_droid" / "assets" / "droid" / "norm_stats.json",
         checkpoint_dir.parent / "pi05_droid_pytorch" / "assets" / "droid" / "norm_stats.json",

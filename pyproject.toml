@@ -17,7 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch", "safetensors", "sentencepiece"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
-server = ["fastapi", "uvicorn"]
+server = ["fastapi", "uvicorn", "websockets"]
 eval = ["opencv-python", "tqdm"]
 # Optional. Required only for the legacy upstream attention path
 # (FVK_RTX_FA2=0 / FVK_RTX_FA2_SITES=...) and the GROOT N1.6/N1.7

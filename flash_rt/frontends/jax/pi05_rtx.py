@@ -21,7 +21,7 @@ Usage::
     pipe.set_prompt("pick up the red block")
     pipe.calibrate_with_real_data([obs])
     out = pipe.infer({"image": img, "wrist_image": wrist})
-    actions = out["actions"]   # (chunk_size, 7) numpy
+    actions = out["actions"]   # (chunk_size, action_dim) numpy
 """
 
 from __future__ import annotations
@@ -484,6 +484,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.graph_recorded = False
         self.current_prompt_len = 0
         self.pipeline = None
+        self._prompt_pipeline_cache: dict[int, object] = {}
 
         # RL CFG state — kept in sync with the torch frontend so the JAX
         # path goes through the same set_prompt / infer hot path. Both

@@ -79,18 +79,26 @@ class Pi05JaxFrontendThor:
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.use_fp8 = bool(use_fp8)
+        self._requested_chunk_size = int(kwargs.get("chunk_size", 10))
+        if self._requested_chunk_size <= 0:
+            raise ValueError(
+                f"chunk_size must be positive, got {self._requested_chunk_size}")
 
         # ── Load norm stats (openpi or lerobot HF release) ──
         from flash_rt.core.utils.norm_stats import (
-            load_norm_stats, lerobot_candidates,
+            load_norm_stats, lerobot_candidates, pi05_candidates,
         )
         self.norm_stats = load_norm_stats(
             [checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
              checkpoint_dir / "norm_stats.json",
+             *pi05_candidates(checkpoint_dir),
              *lerobot_candidates(checkpoint_dir)],
             checkpoint_dir=checkpoint_dir,
             strict=False,
         )
+        self.action_dim = len(self.norm_stats.get("actions", {}).get("q01", []))
+        if not 1 <= self.action_dim <= 32:
+            self.action_dim = 32
 
         # ── FvkContext + GemmRunner + FMHA ──
         from flash_rt import flash_rt_kernels as _fvk
@@ -123,8 +131,14 @@ class Pi05JaxFrontendThor:
             from flash_rt.core.weights.weight_cache import load_weight_cache
             cached = load_weight_cache(str(checkpoint_dir), num_views)
             if cached is not None:
-                self._load_from_cache(cached)
-                cache_hit = True
+                cached_sa = self._cache_chunk_size(cached)
+                if cached_sa is not None and cached_sa != self._requested_chunk_size:
+                    logger.info(
+                        "Ignoring weight cache with Sa=%s; requested chunk_size=%s",
+                        cached_sa, self._requested_chunk_size)
+                else:
+                    self._load_from_cache(cached)
+                    cache_hit = True
 
         if not cache_hit:
             from flash_rt.core.weights.loader import load_weights, detect_format
@@ -322,7 +336,7 @@ class Pi05JaxFrontendThor:
         self._kc_t = np.cos(kp).astype(fp16)
         self._ks_t = np.sin(kp).astype(fp16)
 
-        Sa, Da, Ha, La = 10, 1024, 4096, 18
+        Sa, Da, Ha, La = self._requested_chunk_size, 1024, 4096, 18
         self.Sa = Sa; self.Da = Da; self.Ha = Ha; self.La = La
         total_keys_max = Se_max + Sa
         self.Kc = CB.device_zeros(Le * total_keys_max * HDe, fp16)
@@ -642,6 +656,22 @@ class Pi05JaxFrontendThor:
         self._unit_scale_ptr = self._unit_scale_buf.ptr.value
 
         logger.info("Weights restored from cache")
+
+    @staticmethod
+    def _cache_chunk_size(cached):
+        """Return cached action chunk length without restoring GPU buffers."""
+        header, body = cached
+        for entry in header.get("entries", []):
+            if entry.get("name") != "_dims":
+                continue
+            start = int(entry["offset"])
+            end = start + int(entry["nbytes"])
+            try:
+                dims = json.loads(body[start:end].decode("utf-8"))
+            except Exception:
+                return None
+            return int(dims.get("Sa", 0)) or None
+        return None
 
     def set_prompt(self, prompt_text):
         """Set prompt: tokenize, time conditioning (numpy), RoPE, calibrate, capture graph.
@@ -1661,8 +1691,7 @@ class Pi05JaxFrontendThor:
         appropriate slot of ``_enc_x_b2``, replays the B=N graph,
         unpacks per-slot actions.
         """
-        from flash_rt.core.utils.actions import (
-            unnormalize_actions, LIBERO_ACTION_DIM)
+        from flash_rt.core.utils.actions import unnormalize_actions
         if not self._batched:
             raise RuntimeError(
                 "set_batched_mode(enable=True) must be called first")
@@ -1739,7 +1768,7 @@ class Pi05JaxFrontendThor:
             raw = out_np[b * Sa : (b + 1) * Sa]
             if self.norm_stats:
                 unnorm = unnormalize_actions(raw, self.norm_stats)
-                results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+                results.append({"actions": unnorm[:, :self.action_dim]})
             else:
                 results.append({"actions": raw})
         return results
@@ -2070,8 +2099,7 @@ class Pi05JaxFrontendThor:
             so the same numpy array can be re-uploaded for the uncond
             branch.
         """
-        from flash_rt.core.utils.actions import (
-            unnormalize_actions, LIBERO_ACTION_DIM)
+        from flash_rt.core.utils.actions import unnormalize_actions
         nv = self.num_views
         stream = self._stream
         stream_int = stream.value or 0
@@ -2153,7 +2181,7 @@ class Pi05JaxFrontendThor:
                 latency_ms, self._cfg_pipeline.cfg_beta, self._batched)
         if self.norm_stats:
             unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-            robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+            robot_actions = unnorm[:, :self.action_dim]
         else:
             robot_actions = raw_actions
         return {"actions": robot_actions}
@@ -2547,9 +2575,9 @@ class Pi05JaxFrontendThor:
         raw_actions = self.g_noise.download_new((self.Sa, 32), np.float16).astype(np.float32)
 
         if self.norm_stats:
-            from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+            from flash_rt.core.utils.actions import unnormalize_actions
             unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-            robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+            robot_actions = unnorm[:, :self.action_dim]
         else:
             robot_actions = raw_actions
 

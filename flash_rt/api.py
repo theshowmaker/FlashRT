@@ -277,6 +277,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                awq_alpha=0.5,
                use_p1_split_gu=None,
                num_steps=None,
+               chunk_size=None,
                vision_pool_factor=None,
                vision_num_layers=None,
                cache_frames=None,
@@ -351,6 +352,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ``use_fp8=False`` without ``use_fp16=True`` raises.
         num_steps: Pi0/Pi0.5 torch only when supported. Number of
             flow-matching ODE steps. ``None`` uses the frontend default.
+        chunk_size: Pi0/Pi0.5 only when supported. Number of action steps in
+            the returned action chunk. ``None`` uses the frontend default.
         vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
             for vision tokens; valid values are 1, 2, or 4. ``None`` keeps
             the frontend default.
@@ -503,10 +506,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # users specify groot/pi0fast knobs.
     import inspect
     sig = inspect.signature(pipe_cls)
+    accepts_var_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    def accepts_kwarg(name: str) -> bool:
+        return name in sig.parameters or accepts_var_kwargs
+
     kwargs: dict = {"num_views": num_views}
-    if "hardware" in sig.parameters:
+    if accepts_kwarg("hardware"):
         kwargs["hardware"] = arch
-    if "use_fp8" in sig.parameters:
+    if accepts_kwarg("use_fp8"):
         kwargs["use_fp8"] = use_fp8
     if config == "pi0fast":
         kwargs.update(
@@ -531,18 +541,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     else:
         # pi05, pi0 — both Thor and rtx variants take (checkpoint, num_views, autotune)
         # or (checkpoint, num_views). Feature-detect.
-        if "autotune" in sig.parameters:
+        if accepts_kwarg("autotune"):
             kwargs["autotune"] = autotune
-        if "weight_cache" in sig.parameters:
+        if accepts_kwarg("weight_cache"):
             kwargs["weight_cache"] = weight_cache
         # Orin-specific performance parameters (passed only when accepted and set).
-        if num_steps is not None and "num_steps" in sig.parameters:
+        if num_steps is not None and accepts_kwarg("num_steps"):
             kwargs["num_steps"] = num_steps
-        if vision_pool_factor is not None and "vision_pool_factor" in sig.parameters:
+        if chunk_size is not None and accepts_kwarg("chunk_size"):
+            kwargs["chunk_size"] = chunk_size
+        if vision_pool_factor is not None and accepts_kwarg("vision_pool_factor"):
             kwargs["vision_pool_factor"] = vision_pool_factor
-        if vision_num_layers is not None and "vision_num_layers" in sig.parameters:
+        if vision_num_layers is not None and accepts_kwarg("vision_num_layers"):
             kwargs["vision_num_layers"] = vision_num_layers
-        if cache_frames is not None and "cache_frames" in sig.parameters:
+        if cache_frames is not None and accepts_kwarg("cache_frames"):
             kwargs["cache_frames"] = cache_frames
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).

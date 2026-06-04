@@ -14,7 +14,7 @@ Usage::
     pipe.set_prompt("pick up the red block")
     pipe.calibrate_with_real_data([obs_dict])   # once, ~1 s
     out = pipe.infer({"image": img, "wrist_image": wrist})
-    actions = out["actions"]     # (chunk_size, 7) numpy
+    actions = out["actions"]     # (chunk_size, action_dim) numpy
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.core.utils.actions import unnormalize_actions
 from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
 from flash_rt.models.pi05.pipeline_rtx import (
     Pi05Pipeline,
@@ -352,23 +352,21 @@ def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 def _select_fp8_layout(hardware: Optional[str], fp8_layout: Optional[str]) -> str:
     """Choose the Pi0.5 FP8 weight layout.
 
-    ``kn`` is the existing SM120 path: weights are stored as [K,N] and use
-    ``fp8_nn_dev``. ``nk`` is the SM89-compatible path: weights are stored
-    as [N,K] and use ``fp8_nt_dev``.
+    ``kn`` stores weights as [K,N] and uses the currently exposed
+    ``fp8_nn_dev`` binding. ``nk`` is reserved for builds that also expose
+    ``fp8_nt_dev``.
     """
     if fp8_layout is not None:
         if fp8_layout not in ("kn", "nk"):
             raise ValueError(f"fp8_layout must be 'kn' or 'nk', got {fp8_layout!r}")
         return fp8_layout
-    if hardware == "rtx_sm89":
-        return "nk"
-    if hardware == "rtx_sm120":
+    if hardware in ("rtx_sm89", "rtx_sm120"):
         return "kn"
     try:
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability()
             if major == 8 and minor == 9:
-                return "nk"
+                return "kn"
     except Exception:
         pass
     return "kn"
@@ -700,6 +698,13 @@ class Pi05TorchFrontendRtx:
         except FileNotFoundError as e:
             raise FileNotFoundError(
                 f"norm_stats not found near checkpoint: {e}") from e
+        self.action_dim = len(self.norm_stats.get("actions", {}).get("q01", []))
+        if not 1 <= self.action_dim <= ACTION_DIM:
+            logger.warning(
+                "Invalid/missing action norm_stats dimension %s; falling back to %d",
+                self.action_dim, ACTION_DIM,
+            )
+            self.action_dim = ACTION_DIM
 
     def _quantize_all_fp8(self) -> None:
         """Pre-quantize all large GEMM weights to FP8 E4M3."""
@@ -1526,7 +1531,7 @@ class Pi05TorchFrontendRtx:
 
         raw_actions = self._noise_out.float().cpu().numpy()  # (chunk, 32)
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        robot_actions = unnorm[:, :self.action_dim]
 
         if debug:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
@@ -1577,7 +1582,7 @@ class Pi05TorchFrontendRtx:
 
         raw_actions = self._noise_out.float().cpu().numpy()
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        robot_actions = unnorm[:, :self.action_dim]
 
         if debug:
             logger.info(
@@ -1785,7 +1790,7 @@ class Pi05TorchFrontendRtx:
         for b in range(PI05_BATCH_SIZE):
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            results.append({"actions": unnorm[:, :self.action_dim]})
         return results
 
     def get_latency_stats(self) -> dict:

@@ -71,6 +71,9 @@ def main():
     parser.add_argument('--action_horizon', type=int, default=None,
                         help="GROOT only. Number of action steps to generate "
                              "(default 50; pass 16 for LIBERO)")
+    parser.add_argument('--chunk_size', type=int, default=None,
+                        help="Pi0/Pi0.5 only. Action chunk length. Pass 50 "
+                             "for H10W/OpenPI-style policies.")
     parser.add_argument('--use_fp4', action='store_true',
                         help="Pi0.5 torch only. Enable NVFP4 quantization "
                              "with the production preset: full 18 encoder "
@@ -100,6 +103,7 @@ def main():
         hardware=args.hardware,
         embodiment_tag=args.embodiment_tag,
         action_horizon=args.action_horizon,
+        chunk_size=args.chunk_size,
         use_fp4=args.use_fp4,
         use_fp16=args.use_fp16,
         use_fp8=not args.use_fp16,
