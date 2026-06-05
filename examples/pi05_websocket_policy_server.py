@@ -113,6 +113,9 @@ def parse_args() -> argparse.Namespace:
                         help="Do not disable FP8 in load_model. On 4090 this may hit cuBLASLt code=15.")
     parser.add_argument("--ignore-state", action="store_true",
                         help="Do not pass observation state into model.predict().")
+    parser.add_argument("--fixed-state-prompt-len", type=int, default=None,
+                        help="Pi0.5 RTX: use one fixed state-prompt runtime length "
+                             "(for OpenPI-like fixed-shape serving, use 200).")
     parser.add_argument("--no-h10w-dual-absolute-actions", action="store_true",
                         help="Return raw normalized/unnormalized model actions without H10W dual AbsoluteActions().")
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
@@ -241,6 +244,7 @@ class FlashRTPi05Policy:
             vision_pool_factor=args.vision_pool_factor,
             vision_num_layers=args.vision_num_layers,
             use_fp8=bool(args.use_fp8),
+            fixed_state_prompt_len=args.fixed_state_prompt_len,
         )
         self.load_s = time.perf_counter() - t0
         self._printed_obs_keys = False
@@ -278,6 +282,7 @@ class FlashRTPi05Policy:
             "force_bf16": os.environ.get("FVK_PI05_RTX_FORCE_BF16") == "1",
             "use_fp4": self.args.use_fp4,
             "cache_frames": self.args.cache_frames,
+            "fixed_state_prompt_len": self.args.fixed_state_prompt_len,
             "load_s": self.load_s,
             "action_shape": list(self.action_shape or (self.args.chunk_size, -1)),
         }
@@ -296,17 +301,20 @@ class FlashRTPi05Policy:
         infer_t0 = time.perf_counter()
         actions = self.model.predict(images=images, prompt=prompt, state=state)
         model_result = getattr(self.model, "last_result", None) or {}
+        model_timing = getattr(self.model, "last_timing", {}) or {}
         if state is not None and not self.args.no_h10w_dual_absolute_actions:
             actions = _h10w_dual_absolute_actions(actions, state)
         infer_ms = (time.perf_counter() - infer_t0) * 1000
 
+        policy_timing = {
+            "prep_ms": prep_ms,
+            "predict_ms": infer_ms,
+        }
+        policy_timing.update(model_timing)
         response = {
             "actions": actions,
             "action": actions,
-            "policy_timing": {
-                "prep_ms": prep_ms,
-                "predict_ms": infer_ms,
-            },
+            "policy_timing": policy_timing,
         }
         if "exist" in model_result:
             response["exist"] = _numpy_scalar(model_result["exist"], np.int32)

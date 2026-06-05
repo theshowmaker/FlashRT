@@ -457,6 +457,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         use_fp8: bool = True,
         hardware: Optional[str] = None,
         fp8_layout: Optional[str] = None,
+        fixed_state_prompt_len: Optional[int] = None,
     ):
         # Don't chain to Pi05TorchFrontendRtx.__init__ — it expects a safetensors
         # file. We replicate the body and swap the loader.
@@ -464,6 +465,15 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self.fixed_state_prompt_len = (
+            None if fixed_state_prompt_len is None
+            else int(fixed_state_prompt_len)
+        )
+        if self.fixed_state_prompt_len is not None:
+            if self.fixed_state_prompt_len <= 0:
+                raise ValueError(
+                    f"fixed_state_prompt_len must be positive, got {self.fixed_state_prompt_len}")
+            self.max_prompt_len = max(self.max_prompt_len, self.fixed_state_prompt_len)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
         if self._num_steps <= 0:
@@ -492,6 +502,14 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.current_prompt_len = 0
         self.pipeline = None
         self._prompt_pipeline_cache: dict[int, object] = {}
+        self.prompt_set_count = 0
+        self.pipeline_build_count = 0
+        self.pipeline_cache_hit_count = 0
+        self.language_embed_upload_count = 0
+        self.prompt_embed_time_ms = 0.0
+        self.prompt_pipeline_time_ms = 0.0
+        self.language_embed_upload_time_ms = 0.0
+        self.current_actual_prompt_len = 0
 
         # RL CFG state — kept in sync with the torch frontend so the JAX
         # path goes through the same set_prompt / infer hot path. Both

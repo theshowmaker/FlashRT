@@ -131,6 +131,24 @@ class CudaBuffer:
                     ctypes.c_void_p(arr.ctypes.data + offset), n, 1), "H2D chunk")
                 offset += n
 
+    def upload_torch(self, tensor, stream=None):
+        """Upload CUDA torch tensor → buffer via D2D memcpy."""
+        if not getattr(tensor, "is_cuda", False):
+            raise ValueError("upload_torch expects a CUDA tensor")
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        nbytes = tensor.numel() * tensor.element_size()
+        assert nbytes <= self._nbytes
+        st = ctypes.c_void_p(0 if stream is None else int(stream))
+        _check(_cudart.cudaMemcpyAsync(
+            self._ptr,
+            ctypes.c_void_p(int(tensor.data_ptr())),
+            nbytes,
+            3,
+            st,
+        ), "cudaMemcpyAsync torch D2D")
+        return tensor
+
     def download(self, arr: np.ndarray):
         """Download buffer → numpy.
 

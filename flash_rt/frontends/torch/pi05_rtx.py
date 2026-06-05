@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import ctypes
+import functools
 import json
 import logging
 import math
@@ -59,6 +60,18 @@ fp8_e4m3 = torch.float8_e4m3fn
 CHUNK_SIZE = 10
 IMG_HW = 224
 MAX_PROMPT_LEN_DEFAULT = 48
+
+
+@functools.lru_cache(maxsize=4)
+def _cached_openpi_tokenizer(max_len: int):
+    from openpi.models.tokenizer import PaligemmaTokenizer
+    return PaligemmaTokenizer(max_len=max_len)
+
+
+@functools.lru_cache(maxsize=1)
+def _cached_sentencepiece_tokenizer():
+    from flash_rt.utils.paligemma_tokenizer import load_paligemma_sentencepiece
+    return load_paligemma_sentencepiece()
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -314,8 +327,7 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
     try:
         # Preferred: openpi's PaligemmaTokenizer (exact same vocab,
         # same prompt prefix logic FlashRT was built against).
-        from openpi.models.tokenizer import PaligemmaTokenizer
-        tokenizer = PaligemmaTokenizer(max_len=max_len)
+        tokenizer = _cached_openpi_tokenizer(int(max_len))
         tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
         prompt_len = int(mask_np.sum())
         token_ids = torch.tensor(
@@ -324,10 +336,7 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
         # Fallback: locate the SentencePiece model directly via the
         # FlashRT helper (clear error if not found — never silent
         # segfault).
-        from flash_rt.utils.paligemma_tokenizer import (
-            load_paligemma_sentencepiece,
-        )
-        sp = load_paligemma_sentencepiece()
+        sp = _cached_sentencepiece_tokenizer()
         if state is None:
             # 108 is PaliGemma's `\n` token, used by openpi as the
             # prompt-end separator before the action prefix.
@@ -489,11 +498,21 @@ class Pi05TorchFrontendRtx:
                  cache_frames: int = 1,
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
-                 fp8_layout: Optional[str] = None):
+                 fp8_layout: Optional[str] = None,
+                 fixed_state_prompt_len: Optional[int] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self.fixed_state_prompt_len = (
+            None if fixed_state_prompt_len is None
+            else int(fixed_state_prompt_len)
+        )
+        if self.fixed_state_prompt_len is not None:
+            if self.fixed_state_prompt_len <= 0:
+                raise ValueError(
+                    f"fixed_state_prompt_len must be positive, got {self.fixed_state_prompt_len}")
+            self.max_prompt_len = max(self.max_prompt_len, self.fixed_state_prompt_len)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
         if self._num_steps <= 0:
@@ -526,6 +545,14 @@ class Pi05TorchFrontendRtx:
         self.current_prompt_len = 0
         self.pipeline: Optional[Pi05Pipeline] = None
         self._prompt_pipeline_cache: dict[int, Pi05Pipeline] = {}
+        self.prompt_set_count = 0
+        self.pipeline_build_count = 0
+        self.pipeline_cache_hit_count = 0
+        self.language_embed_upload_count = 0
+        self.prompt_embed_time_ms = 0.0
+        self.prompt_pipeline_time_ms = 0.0
+        self.language_embed_upload_time_ms = 0.0
+        self.current_actual_prompt_len = 0
         # RL inference configuration. ``None`` = default behaviour (single
         # forward, no advantage-conditioned prompt injection). When set
         # by :meth:`set_rl_mode`, the next :meth:`set_prompt` call builds
@@ -1017,6 +1044,7 @@ class Pi05TorchFrontendRtx:
         builds the unconditioned prompt embeddings and uploads both into
         the CFG-aware pipeline.
         """
+        self.prompt_set_count += 1
         if self._rl_config is not None:
             if state is not None:
                 raise ValueError(
@@ -1026,26 +1054,39 @@ class Pi05TorchFrontendRtx:
 
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
+        t_embed0 = time.perf_counter()
         embeds, prompt_len = _embed_prompt(
             prompt_text, self.embedding_weight, max_len=max_len, state=state)
-        required_capacity = (PI05_STATE_PROMPT_MAX_LEN if state is not None
-                             else prompt_len)
+        self.prompt_embed_time_ms += (time.perf_counter() - t_embed0) * 1000
+        runtime_prompt_len = prompt_len
+        if state is not None and self.fixed_state_prompt_len is not None:
+            if prompt_len > self.fixed_state_prompt_len:
+                raise ValueError(
+                    f"tokenized state prompt length {prompt_len} exceeds "
+                    f"fixed_state_prompt_len={self.fixed_state_prompt_len}")
+            runtime_prompt_len = self.fixed_state_prompt_len
+        required_capacity = runtime_prompt_len
         self._ensure_prompt_capacity(required_capacity)
 
-        if self.pipeline is None or prompt_len != self.current_prompt_len:
-            cached = self._prompt_pipeline_cache.get(prompt_len)
-            self.current_prompt_len = prompt_len
+        t_pipeline0 = time.perf_counter()
+        if self.pipeline is None or runtime_prompt_len != self.current_prompt_len:
+            cached = self._prompt_pipeline_cache.get(runtime_prompt_len)
+            self.current_prompt_len = runtime_prompt_len
             if cached is not None:
+                self.pipeline_cache_hit_count += 1
                 self.pipeline = cached
                 self.graph_recorded = getattr(cached, "_graph", None) is not None
                 self.calibrated = (
                     self.graph_recorded
                     or bool(getattr(cached, "fp8_calibrated", False)))
-                logger.info("Reusing cached Pi05Pipeline for prompt_len=%d",
-                            prompt_len)
+                logger.info(
+                    "Reusing cached Pi05Pipeline for runtime_prompt_len=%d actual_prompt_len=%d",
+                    runtime_prompt_len, prompt_len)
             else:
-                logger.info("Building Pi05Pipeline for prompt_len=%d...",
-                            prompt_len)
+                self.pipeline_build_count += 1
+                logger.info(
+                    "Building Pi05Pipeline for runtime_prompt_len=%d actual_prompt_len=%d...",
+                    runtime_prompt_len, prompt_len)
                 # Rebuild the pipeline with the exact prompt length to avoid
                 # wasted compute on padding tokens. The instance is cached so
                 # Pi0.5 discrete-state prompt lengths do not repeatedly pay
@@ -1058,25 +1099,62 @@ class Pi05TorchFrontendRtx:
                     gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
                     weights=pipeline_weights,
                     num_views=self.num_views,
-                    max_prompt_len=prompt_len,
+                    max_prompt_len=runtime_prompt_len,
                     chunk_size=self.chunk_size,
                     num_steps=self._num_steps,
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
                     **self._pipeline_precision_kwargs())
-                self._prompt_pipeline_cache[prompt_len] = self.pipeline
+                self._prompt_pipeline_cache[runtime_prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
                 # Reset so calibrate_single_frame collects fresh scales.
                 if self.pipeline.use_int8_vision_static:
                     self.pipeline.vis_int8_static_calibrated = False
                     self.pipeline.vis_int8_static_scales = {}
+        self.prompt_pipeline_time_ms += (time.perf_counter() - t_pipeline0) * 1000
 
         # Upload language embeds into pipeline's encoder_x slot
-        embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
-        self.pipeline.set_language_embeds(embeds_np)
+        t_upload0 = time.perf_counter()
+        embeds = embeds.contiguous()
+        if runtime_prompt_len != prompt_len:
+            padded = embeds.new_zeros((runtime_prompt_len, embeds.shape[1]))
+            padded[:prompt_len].copy_(embeds)
+            embeds = padded
+        if hasattr(self.pipeline, "set_language_embeds_torch"):
+            self.pipeline.set_language_embeds_torch(
+                embeds, actual_prompt_len=prompt_len)
+        else:
+            embeds_np = embeds.view(torch.uint16).cpu().numpy()
+            self.pipeline.set_language_embeds(
+                embeds_np, actual_prompt_len=prompt_len)
+        self.language_embed_upload_time_ms += (
+            time.perf_counter() - t_upload0) * 1000
+        self.language_embed_upload_count += 1
+        self.current_actual_prompt_len = int(prompt_len)
         self._frame_count = 0
-        logger.info("Set prompt: '%s' (%d tokens, state=%s)",
-                    prompt_text, prompt_len, state is not None)
+        logger.info("Set prompt: '%s' (%d tokens, runtime=%d, state=%s)",
+                    prompt_text, prompt_len, runtime_prompt_len, state is not None)
+
+    def debug_prompt_stats(self) -> dict:
+        """Return prompt/runtime counters for latency tests."""
+        return {
+            "prompt_set_count": int(self.prompt_set_count),
+            "pipeline_build_count": int(self.pipeline_build_count),
+            "pipeline_cache_hit_count": int(self.pipeline_cache_hit_count),
+            "language_embed_upload_count": int(self.language_embed_upload_count),
+            "current_prompt_len": int(self.current_prompt_len),
+            "current_actual_prompt_len": int(self.current_actual_prompt_len),
+            "fixed_state_prompt_len": (
+                None if self.fixed_state_prompt_len is None
+                else int(self.fixed_state_prompt_len)
+            ),
+            "cached_prompt_lens": sorted(int(k) for k in self._prompt_pipeline_cache),
+            "graph_recorded": bool(self.graph_recorded),
+            "calibrated": bool(self.calibrated),
+            "prompt_embed_time_ms": float(self.prompt_embed_time_ms),
+            "prompt_pipeline_time_ms": float(self.prompt_pipeline_time_ms),
+            "language_embed_upload_time_ms": float(self.language_embed_upload_time_ms),
+        }
 
     def warm_state_prompt_buckets(self, prompt_text: str, states,
                                   sample_observation: dict) -> list[int]:

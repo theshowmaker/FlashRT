@@ -2084,7 +2084,7 @@ class Pi05PipelineFP16:
         """Pipeline input: encoder_x, with language embeds at [vs:vs+len]."""
         return self.bufs["encoder_x"]
 
-    def set_language_embeds(self, lang_embeds_np) -> None:
+    def set_language_embeds(self, lang_embeds_np, actual_prompt_len: int | None = None) -> None:
         """Store language embeddings for this prompt.
 
         The embeds are kept as a persistent device-side copy and are
@@ -2110,14 +2110,47 @@ class Pi05PipelineFP16:
             self._lang_embeds_buf.upload(arr)
         else:
             self._lang_embeds_buf = CudaBuffer.from_numpy(arr)
-        self._current_prompt_len = prompt_len
+        actual_len = prompt_len if actual_prompt_len is None else int(actual_prompt_len)
+        if actual_len <= 0 or actual_len > prompt_len:
+            raise ValueError(
+                f"actual_prompt_len must be in [1, {prompt_len}], got {actual_len}")
+        self._current_prompt_len = actual_len
 
         # Update decoder RoPE slice for this prompt length
-        self._set_decoder_rope_for_prompt(prompt_len)
+        self._set_decoder_rope_for_prompt(actual_len)
 
         # Initial copy into encoder_x (so the FIRST calibration pass sees
         # the correct lang embeds without needing a prior forward() call).
         self._copy_lang_embeds_to_encoder_x()
+
+    def set_language_embeds_torch(self, lang_embeds_t, actual_prompt_len: int | None = None) -> None:
+        """Store CUDA torch language embeddings without a D2H/H2D round trip."""
+        if not getattr(lang_embeds_t, "is_cuda", False):
+            raise ValueError("set_language_embeds_torch expects a CUDA tensor")
+        if not lang_embeds_t.is_contiguous():
+            lang_embeds_t = lang_embeds_t.contiguous()
+        prompt_len = int(lang_embeds_t.shape[0])
+        assert prompt_len <= self.max_prompt_len, \
+            f"prompt_len {prompt_len} exceeds max_prompt_len {self.max_prompt_len}"
+        assert int(lang_embeds_t.shape[1]) == ENC_D
+        nbytes = lang_embeds_t.numel() * lang_embeds_t.element_size()
+        import torch
+        stream = int(torch.cuda.current_stream(lang_embeds_t.device).cuda_stream)
+        if (hasattr(self, "_lang_embeds_buf")
+                and self._lang_embeds_buf.nbytes == nbytes):
+            self._last_lang_embeds_tensor = self._lang_embeds_buf.upload_torch(
+                lang_embeds_t, stream=stream)
+        else:
+            self._lang_embeds_buf = CudaBuffer(nbytes, managed=False)
+            self._last_lang_embeds_tensor = self._lang_embeds_buf.upload_torch(
+                lang_embeds_t, stream=stream)
+        actual_len = prompt_len if actual_prompt_len is None else int(actual_prompt_len)
+        if actual_len <= 0 or actual_len > prompt_len:
+            raise ValueError(
+                f"actual_prompt_len must be in [1, {prompt_len}], got {actual_len}")
+        self._current_prompt_len = actual_len
+        self._set_decoder_rope_for_prompt(actual_len)
+        self._copy_lang_embeds_to_encoder_x(stream=stream)
 
     def _copy_lang_embeds_to_encoder_x(self, stream: int = 0) -> None:
         """D2D copy stored lang embeds into encoder_x[vs:vs+prompt_len]."""

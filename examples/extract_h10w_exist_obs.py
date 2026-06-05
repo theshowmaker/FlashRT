@@ -78,7 +78,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/home/peng.song/vla/small-vla/spi/datasets/MERGED_0303_posneg_224_arrow"),
     )
-    p.add_argument("--exist", type=int, default=1, choices=(0, 1))
+    p.add_argument("--exist", default="1", choices=("0", "1", "any"),
+                   help="Filter by exist_label, or use 'any' for unfiltered real sequences.")
     p.add_argument("--count", type=int, default=8)
     p.add_argument("--out-dir", type=Path, default=Path("tmp/h10w_exist_obs"))
     p.add_argument("--prompt", default=None, help="Override prompt for all samples.")
@@ -98,6 +99,8 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     manifest = []
     saved = 0
+    exist_filter = None if args.exist == "any" else int(args.exist)
+    exist_name = "any" if exist_filter is None else str(exist_filter)
 
     for path in sorted(episodes_dir.glob("episode_*.arrow")):
         try:
@@ -109,7 +112,7 @@ def main() -> int:
 
         table = _read_arrow(path)
         labels = np.asarray(table["exist_label"].to_pylist(), dtype=np.int8)
-        rows = np.flatnonzero(labels == args.exist)
+        rows = np.arange(len(labels), dtype=np.int64) if exist_filter is None else np.flatnonzero(labels == exist_filter)
         if args.stride > 1 and len(rows):
             kept = []
             last = -args.stride
@@ -122,15 +125,16 @@ def main() -> int:
             task_index = int(table["task_index"][int(row)].as_py())
             prompt = args.prompt or tasks.get(task_index, "do something")
             obs = _obs_from_row(table, int(row), prompt)
+            exist_label = int(labels[int(row)])
             episode_index = int(table["episode_index"][int(row)].as_py())
             frame_index = int(table["frame_index"][int(row)].as_py())
             out = args.out_dir / (
-                f"exist{args.exist}_episode{episode_index:06d}_frame{frame_index:06d}.npz"
+                f"exist{exist_label}_episode{episode_index:06d}_frame{frame_index:06d}.npz"
             )
             np.savez_compressed(
                 out,
                 obs=np.array(obs, dtype=object),
-                exist_label=np.asarray(args.exist, dtype=np.int32),
+                exist_label=np.asarray(exist_label, dtype=np.int32),
                 episode_index=np.asarray(episode_index, dtype=np.int64),
                 frame_index=np.asarray(frame_index, dtype=np.int64),
                 task_index=np.asarray(task_index, dtype=np.int64),
@@ -139,7 +143,7 @@ def main() -> int:
             manifest.append(
                 {
                     "path": str(out),
-                    "exist_label": args.exist,
+                    "exist_label": exist_label,
                     "episode_index": episode_index,
                     "frame_index": frame_index,
                     "task_index": task_index,
@@ -149,12 +153,13 @@ def main() -> int:
             saved += 1
             print(f"saved {out} prompt={prompt!r}")
             if saved >= args.count:
-                manifest_path = args.out_dir / f"manifest_exist{args.exist}.json"
+                manifest_path = args.out_dir / f"manifest_exist{exist_name}.json"
                 manifest_path.write_text(json.dumps(manifest, indent=2))
                 print(f"manifest: {manifest_path}")
                 return 0
 
-    raise SystemExit(f"only found {saved} samples with exist_label={args.exist}")
+    label_msg = "any exist_label" if exist_filter is None else f"exist_label={exist_filter}"
+    raise SystemExit(f"only found {saved} samples with {label_msg}")
 
 
 if __name__ == "__main__":

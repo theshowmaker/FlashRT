@@ -11,6 +11,7 @@ equality.
 from __future__ import annotations
 
 import argparse
+import glob
 import time
 from pathlib import Path
 from typing import Any
@@ -145,6 +146,36 @@ def _compare(a: np.ndarray, b: np.ndarray) -> dict:
     }
 
 
+def _latency_stats(name: str, values: list[float]) -> str:
+    if not values:
+        return f"{name}: no samples"
+    arr = np.asarray(values, dtype=np.float64)
+    return (
+        f"{name}: min={arr.min():.2f} ms, p50={np.percentile(arr, 50):.2f} ms, "
+        f"p90={np.percentile(arr, 90):.2f} ms, p95={np.percentile(arr, 95):.2f} ms, "
+        f"mean={arr.mean():.2f} ms, max={arr.max():.2f} ms"
+    )
+
+
+def _numeric_timing(out: dict) -> dict[str, float]:
+    timing = out.get("policy_timing") or out.get("server_timing") or {}
+    result = {}
+    if isinstance(timing, dict):
+        for k, v in timing.items():
+            try:
+                result[str(k)] = float(v)
+            except Exception:
+                pass
+    return result
+
+
+def _print_timing_summary(prefix: str, rows: list[dict[str, float]]) -> None:
+    keys = sorted({k for row in rows for k in row})
+    for key in keys:
+        values = [row[key] for row in rows if key in row]
+        print(_latency_stats(f"{prefix} {key}", values))
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare openpi and FlashRT websocket policy outputs.")
     p.add_argument("--openpi-host", default="127.0.0.1")
@@ -156,8 +187,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--obs-npz", type=Path, default=None,
                    help="Optional .npz observation. If omitted, random H10W observations are generated.")
+    p.add_argument("--obs-glob", default=None,
+                   help="Glob of .npz observations to replay in sorted order. "
+                        "Use quotes so the shell does not expand it.")
     p.add_argument("--fixed-obs", action="store_true",
                    help="Reuse the exact same observation for every step.")
+    p.add_argument("--require-exist", type=int, choices=(0, 1), default=None,
+                   help="Fail unless both services return this exist value.")
+    p.add_argument("--summary-skip", type=int, default=0,
+                   help="Skip the first N calls in latency summaries.")
     p.add_argument("--save", type=Path, default=None,
                    help="Optional output .npz containing actions and last obs.")
     return p.parse_args()
@@ -165,29 +203,64 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.obs_npz is not None and args.obs_glob is not None:
+        raise ValueError("--obs-npz and --obs-glob are mutually exclusive")
+
     openpi = PolicyClient(args.openpi_host, args.openpi_port)
     flashrt = PolicyClient(args.flashrt_host, args.flashrt_port)
     print(f"openpi metadata:  {openpi.metadata}")
     print(f"flashrt metadata: {flashrt.metadata}")
 
-    base_obs = _load_obs(args.obs_npz) if args.obs_npz else _random_h10w_obs(args.seed, args.prompt)
+    obs_paths = [Path(p) for p in sorted(glob.glob(args.obs_glob))] if args.obs_glob else []
+    if args.obs_glob and not obs_paths:
+        raise FileNotFoundError(f"--obs-glob matched no files: {args.obs_glob}")
+    if obs_paths:
+        print(f"replaying {min(args.steps, len(obs_paths))} obs files from: {args.obs_glob}")
+
+    base_obs = (
+        _load_obs(obs_paths[0]) if obs_paths
+        else _load_obs(args.obs_npz) if args.obs_npz
+        else _random_h10w_obs(args.seed, args.prompt)
+    )
     openpi_actions = []
     flashrt_actions = []
     last_obs = base_obs
     openpi_exist = []
     flashrt_exist = []
+    openpi_times = []
+    flashrt_times = []
+    openpi_policy_timings = []
+    flashrt_policy_timings = []
+    used_obs_paths = []
 
     for i in range(args.steps):
-        obs = base_obs if args.fixed_obs else (
-            _load_obs(args.obs_npz) if args.obs_npz else _random_h10w_obs(args.seed + i, args.prompt)
-        )
+        if args.fixed_obs:
+            obs = base_obs
+            obs_path = obs_paths[0] if obs_paths else args.obs_npz
+        elif obs_paths:
+            if i >= len(obs_paths):
+                break
+            obs_path = obs_paths[i]
+            obs = _load_obs(obs_path)
+        elif args.obs_npz:
+            obs_path = args.obs_npz
+            obs = _load_obs(args.obs_npz)
+        else:
+            obs_path = None
+            obs = _random_h10w_obs(args.seed + i, args.prompt)
         last_obs = obs
+        if obs_path is not None:
+            used_obs_paths.append(str(obs_path))
         t0 = time.perf_counter()
         out_a = openpi.infer(obs)
         t_a = (time.perf_counter() - t0) * 1000
+        openpi_times.append(t_a)
+        openpi_policy_timings.append(_numeric_timing(out_a))
         t0 = time.perf_counter()
         out_b = flashrt.infer(obs)
         t_b = (time.perf_counter() - t0) * 1000
+        flashrt_times.append(t_b)
+        flashrt_policy_timings.append(_numeric_timing(out_b))
         act_a = _actions(out_a)
         act_b = _actions(out_b)
         openpi_actions.append(act_a)
@@ -200,6 +273,21 @@ def main() -> int:
             openpi_exist.append(exist_a)
             flashrt_exist.append(exist_b)
             exist_msg = f" exist_openpi={exist_a} exist_flashrt={exist_b}"
+            if args.require_exist is not None:
+                required = int(args.require_exist)
+                if exist_a is None or exist_b is None:
+                    raise RuntimeError(
+                        f"--require-exist={required} but one service did not return exist: "
+                        f"openpi={exist_a}, flashrt={exist_b}"
+                    )
+                if int(np.asarray(exist_a).reshape(-1)[0]) != required:
+                    raise RuntimeError(
+                        f"openpi exist={exist_a}, expected {required}"
+                    )
+                if int(np.asarray(exist_b).reshape(-1)[0]) != required:
+                    raise RuntimeError(
+                        f"flashrt exist={exist_b}, expected {required}"
+                    )
         print(f"[{i:03d}] openpi={t_a:.2f} ms flashrt={t_b:.2f} ms compare={cmp}{exist_msg}")
 
     a = np.stack(openpi_actions)
@@ -207,6 +295,13 @@ def main() -> int:
     print(_stats("openpi actions", a))
     print(_stats("flashrt actions", b))
     print(f"aggregate compare: {_compare(a, b)}")
+    skip = max(0, int(args.summary_skip))
+    if skip:
+        print(f"latency summary skips first {skip} call(s)")
+    print(_latency_stats("openpi latency", openpi_times[skip:]))
+    print(_latency_stats("flashrt latency", flashrt_times[skip:]))
+    _print_timing_summary("openpi policy", openpi_policy_timings[skip:])
+    _print_timing_summary("flashrt policy", flashrt_policy_timings[skip:])
     if openpi_exist or flashrt_exist:
         print(f"openpi exist:  {openpi_exist}")
         print(f"flashrt exist: {flashrt_exist}")
@@ -219,6 +314,11 @@ def main() -> int:
             flashrt_actions=b,
             openpi_exist=np.array(openpi_exist, dtype=object),
             flashrt_exist=np.array(flashrt_exist, dtype=object),
+            openpi_times_ms=np.asarray(openpi_times, dtype=np.float32),
+            flashrt_times_ms=np.asarray(flashrt_times, dtype=np.float32),
+            openpi_policy_timings=np.array(openpi_policy_timings, dtype=object),
+            flashrt_policy_timings=np.array(flashrt_policy_timings, dtype=object),
+            obs_paths=np.asarray(used_obs_paths, dtype=object),
             obs=np.array(last_obs, dtype=object),
         )
         print(f"saved: {args.save}")

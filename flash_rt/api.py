@@ -18,6 +18,7 @@ FlashRT — Public API.
 
 import logging
 import os
+import time
 
 # Silence ``torch_xla``'s "Defaulting to PJRT_DEVICE=CPU" warning that
 # fires when openpi (pulled in by the Pi0.5 torch frontend for the
@@ -40,6 +41,7 @@ class VLAModel:
         self._current_prompt = None
         self._current_prompt_state = None
         self._last_result = None
+        self._last_timing = {}
         # rtx Pi0.5 (RtxTorchPi05) requires an explicit
         # ``calibrate_with_real_data([obs])`` call before the first
         # ``infer()``; Thor / rtx GROOT lazy-calibrate inside ``infer()``.
@@ -102,12 +104,15 @@ class VLAModel:
             sig = None
             prompt_accepts_state = False
 
+        set_prompt_ms = 0.0
         if prompt_changed or prompt_state_changed:
             if hasattr(self._pipe, 'set_prompt'):
+                t0 = time.perf_counter()
                 if prompt_accepts_state:
                     self._pipe.set_prompt(prompt_for_call, state=state)
                 else:
                     self._pipe.set_prompt(prompt_for_call)
+                set_prompt_ms = (time.perf_counter() - t0) * 1000
             self._current_prompt = prompt_for_call
             self._current_prompt_state = self._snapshot_prompt_state(state)
 
@@ -141,17 +146,32 @@ class VLAModel:
             needs_real_data_calibration = True
         if (needs_real_data_calibration
                 and hasattr(self._pipe, "calibrate_with_real_data")):
+            t0 = time.perf_counter()
             self._pipe.calibrate_with_real_data([obs])
+            calibrate_ms = (time.perf_counter() - t0) * 1000
             self._needs_real_data_calibration = False
+        else:
+            calibrate_ms = 0.0
 
+        t0 = time.perf_counter()
         result = self._pipe.infer(obs)
+        infer_ms = (time.perf_counter() - t0) * 1000
         self._last_result = result
+        self._last_timing = {
+            "set_prompt_ms": set_prompt_ms,
+            "calibrate_ms": calibrate_ms,
+            "infer_ms": infer_ms,
+        }
         return result['actions']
 
     @property
     def last_result(self):
         """Full result dict returned by the frontend during the last predict()."""
         return self._last_result
+
+    @property
+    def last_timing(self):
+        return dict(self._last_timing)
 
     def warm_state_prompt_buckets(self, images, prompt, states):
         """Pre-build Pi0.5 state-prompt runtime buckets.
@@ -289,7 +309,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                vision_num_layers=None,
                cache_frames=None,
                use_fp16=False,
-               use_fp8=True):
+               use_fp8=True,
+               fixed_state_prompt_len=None):
     """Load a FlashRT model.
 
     Args:
@@ -371,6 +392,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
+        fixed_state_prompt_len: Pi0.5 RTX only. When set and ``state`` is
+            passed to ``predict()``, build one fixed-length state-prompt
+            runtime instead of per-token-length buckets.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -563,6 +587,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["vision_num_layers"] = vision_num_layers
         if cache_frames is not None and accepts_kwarg("cache_frames"):
             kwargs["cache_frames"] = cache_frames
+        if fixed_state_prompt_len is not None and accepts_kwarg("fixed_state_prompt_len"):
+            kwargs["fixed_state_prompt_len"] = fixed_state_prompt_len
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:
