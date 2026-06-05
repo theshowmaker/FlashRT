@@ -118,9 +118,10 @@ def parse_args() -> argparse.Namespace:
                              "(for OpenPI-like fixed-shape serving, use 200).")
     parser.add_argument("--prompt-mode", default="bucketed",
                         choices=["bucketed", "fixed", "openpi_masked_fixed200"],
-                        help="Pi0.5 RTX prompt runtime mode. openpi_masked_fixed200 "
+                        help="Pi0.5 prompt runtime mode. On RTX, openpi_masked_fixed200 "
                              "uses fixed 200-token state prompts plus OpenPI-style "
-                             "prefix padding masks.")
+                             "prefix padding masks. On Thor, it currently uses the "
+                             "fixed 200-token shape without prefix-mask kernels.")
     parser.add_argument("--no-h10w-dual-absolute-actions", action="store_true",
                         help="Return raw normalized/unnormalized model actions without H10W dual AbsoluteActions().")
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
@@ -283,6 +284,9 @@ class FlashRTPi05Policy:
         fixed_len = getattr(pipe, "fixed_state_prompt_len", self.args.fixed_state_prompt_len)
         prompt_mode = getattr(pipe, "prompt_mode", self.args.prompt_mode)
         openpi_masked = bool(getattr(pipe, "openpi_masked_prefix", False))
+        prompt_mask_supported = bool(getattr(pipe, "prompt_mask_supported", openpi_masked))
+        fast_state_tokenizer = bool(getattr(pipe, "debug_prompt_stats", lambda: {})().get(
+            "fast_state_tokenizer", os.environ.get("FLASH_RT_PI05_FAST_STATE_TOKENIZER", "1") != "0"))
         return {
             "model": "pi05",
             "framework": self.args.framework,
@@ -296,6 +300,8 @@ class FlashRTPi05Policy:
             "prompt_mode": prompt_mode,
             "prompt_capacity": fixed_len,
             "openpi_masked_prefix": openpi_masked,
+            "prompt_mask_supported": prompt_mask_supported,
+            "fast_state_tokenizer": fast_state_tokenizer,
             "load_s": self.load_s,
             "action_shape": list(self.action_shape or (self.args.chunk_size, -1)),
         }

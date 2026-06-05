@@ -162,6 +162,9 @@ class VLAModel:
             "calibrate_ms": calibrate_ms,
             "infer_ms": infer_ms,
         }
+        pipe_prompt_timing = getattr(self._pipe, "last_prompt_timing", None)
+        if isinstance(pipe_prompt_timing, dict):
+            self._last_timing.update(pipe_prompt_timing)
         return result['actions']
 
     @property

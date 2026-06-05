@@ -54,7 +54,12 @@ import jax
 import jax.numpy as jnp
 
 
-from flash_rt.core.thor_frontend_utils import embed_prompt_numpy as _embed_prompt  # noqa: E402
+from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN  # noqa: E402
+from flash_rt.core.thor_frontend_utils import (  # noqa: E402
+    embed_prompt_numpy as _embed_prompt,
+    fast_state_tokenizer_cache_size,
+    fast_state_tokenizer_enabled,
+)
 
 
 class Pi05JaxFrontendThor:
@@ -83,6 +88,26 @@ class Pi05JaxFrontendThor:
         if self._requested_chunk_size <= 0:
             raise ValueError(
                 f"chunk_size must be positive, got {self._requested_chunk_size}")
+        self.prompt_mode = str(kwargs.get("prompt_mode", "bucketed") or "bucketed")
+        valid_prompt_modes = {"bucketed", "fixed", "openpi_masked_fixed200"}
+        if self.prompt_mode not in valid_prompt_modes:
+            raise ValueError(
+                f"prompt_mode must be one of {sorted(valid_prompt_modes)}, "
+                f"got {self.prompt_mode!r}")
+        fixed_state_prompt_len = kwargs.get("fixed_state_prompt_len", None)
+        if self.prompt_mode == "openpi_masked_fixed200" and fixed_state_prompt_len is None:
+            fixed_state_prompt_len = PI05_STATE_PROMPT_MAX_LEN
+        self.fixed_state_prompt_len = (
+            None if fixed_state_prompt_len is None else int(fixed_state_prompt_len)
+        )
+        if self.fixed_state_prompt_len is not None and self.fixed_state_prompt_len <= 0:
+            raise ValueError(
+                f"fixed_state_prompt_len must be positive, got {self.fixed_state_prompt_len}")
+        # Thor currently has a fixed-shape prompt path but no general prefix
+        # padding mask in flash_rt_kernels.so. Keep metadata explicit.
+        self.openpi_masked_prefix = False
+        self.prompt_mask_supported = False
+        self._thor_mask_warning_emitted = False
 
         # ── Load norm stats (openpi or lerobot HF release) ──
         from flash_rt.core.utils.norm_stats import (
@@ -164,6 +189,14 @@ class Pi05JaxFrontendThor:
         # ── State ──
         self._checkpoint_path = str(checkpoint_dir)
         self.current_prompt = None
+        self.current_prompt_len = 0
+        self.current_actual_prompt_len = 0
+        self.prompt_set_count = 0
+        self.prompt_fast_update_count = 0
+        self.pipeline_build_count = 0
+        self.language_embed_upload_count = 0
+        self.last_prompt_timing = {}
+        self.last_timing = {}
         self.calibrated = False
         self._real_data_calibrated = False
 
@@ -709,7 +742,98 @@ class Pi05JaxFrontendThor:
             return None
         return bool(dims.get("has_exist_head"))
 
-    def set_prompt(self, prompt_text):
+    def _state_prompt_capacity(self, state):
+        if state is None:
+            return None
+        return self.fixed_state_prompt_len
+
+    def _pad_prompt_embeds(self, embeds_np, prompt_len, runtime_prompt_len, fixed_state):
+        if runtime_prompt_len < prompt_len:
+            raise ValueError(
+                f"prompt token length {prompt_len} exceeds fixed runtime "
+                f"capacity {runtime_prompt_len}")
+        if runtime_prompt_len == prompt_len:
+            return embeds_np[:runtime_prompt_len].astype(np.float16)
+        pad_len = runtime_prompt_len - prompt_len
+        if fixed_state:
+            pad = np.zeros((pad_len, embeds_np.shape[1]), dtype=embeds_np.dtype)
+        else:
+            pad = np.repeat(embeds_np[-1:], pad_len, axis=0)
+        return np.concatenate([embeds_np, pad], axis=0)[:runtime_prompt_len].astype(np.float16)
+
+    def _decoder_rope_start(self, prompt_len, Se, fixed_state):
+        if fixed_state:
+            return max(0, self.sig_dims[0] + int(prompt_len) - 1)
+        return Se
+
+    def _decoder_rope_np(self, prompt_len, Se, fixed_state):
+        dec_start = self._decoder_rope_start(prompt_len, Se, fixed_state)
+        return np.concatenate(
+            [self._kc_t[dec_start:dec_start+self.Sa, :, None],
+             self._ks_t[dec_start:dec_start+self.Sa, :, None]], 2).reshape(self.Sa, 256)
+
+    def _warn_thor_mask_not_supported(self):
+        if self.prompt_mode != "openpi_masked_fixed200" or self._thor_mask_warning_emitted:
+            return
+        logger.warning(
+            "prompt_mode=openpi_masked_fixed200 requested on Thor, but the Thor "
+            "attention kernels do not yet support OpenPI prefix padding masks. "
+            "Running fixed200 no-mask mode with stable graph shape.")
+        self._thor_mask_warning_emitted = True
+
+    def _can_fast_update_fixed_prompt(self, Se, runtime_prompt_len, fixed_state):
+        if not fixed_state:
+            return False
+        if getattr(self, "lang_emb", None) is None or getattr(self, "dec_rope", None) is None:
+            return False
+        if getattr(self, "siglip_graph", None) is None:
+            return False
+        if getattr(self, "enc_ae_graph", None) is None:
+            return False
+        return getattr(self, "Se", None) == Se and getattr(self, "S_lang", None) == runtime_prompt_len
+
+    def _update_fixed_prompt_buffers(self, embeds_np, prompt_len, runtime_prompt_len, Se):
+        t0 = _time.perf_counter()
+        fp16 = np.float16
+        padded = self._pad_prompt_embeds(
+            embeds_np, prompt_len, runtime_prompt_len, fixed_state=True)
+        t_pad = _time.perf_counter()
+        self.lang_emb.upload(padded.astype(fp16))
+        t_lang = _time.perf_counter()
+        dec_rope_np = self._decoder_rope_np(prompt_len, Se, fixed_state=True)
+        self.dec_rope.upload(dec_rope_np.astype(fp16))
+        t_rope = _time.perf_counter()
+        self.current_prompt_len = int(runtime_prompt_len)
+        self.current_actual_prompt_len = int(prompt_len)
+        self.prompt_fast_update_count += 1
+        self.language_embed_upload_count += 1
+        self.last_prompt_timing.update({
+            "thor_prompt_pad_ms": (t_pad - t0) * 1000,
+            "thor_prompt_lang_upload_ms": (t_lang - t_pad) * 1000,
+            "thor_prompt_rope_upload_ms": (t_rope - t_lang) * 1000,
+            "thor_prompt_buffer_update_ms": (t_rope - t0) * 1000,
+        })
+
+    def debug_prompt_stats(self):
+        return {
+            "prompt_mode": self.prompt_mode,
+            "fixed_state_prompt_len": self.fixed_state_prompt_len,
+            "prompt_capacity": self.fixed_state_prompt_len,
+            "openpi_masked_prefix": bool(self.openpi_masked_prefix),
+            "prompt_mask_supported": bool(self.prompt_mask_supported),
+            "fast_state_tokenizer": bool(fast_state_tokenizer_enabled()),
+            "fast_state_tokenizer_cache_size": int(fast_state_tokenizer_cache_size()),
+            "current_prompt_len": int(getattr(self, "current_prompt_len", 0)),
+            "current_actual_prompt_len": int(getattr(self, "current_actual_prompt_len", 0)),
+            "Se": int(getattr(self, "Se", 0)),
+            "total_keys": int(getattr(self, "total_keys", 0)),
+            "prompt_set_count": int(getattr(self, "prompt_set_count", 0)),
+            "prompt_fast_update_count": int(getattr(self, "prompt_fast_update_count", 0)),
+            "pipeline_build_count": int(getattr(self, "pipeline_build_count", 0)),
+            "language_embed_upload_count": int(getattr(self, "language_embed_upload_count", 0)),
+        }
+
+    def set_prompt(self, prompt_text, state=None):
         """Set prompt: tokenize, time conditioning (numpy), RoPE, calibrate, capture graph.
 
         When :meth:`set_rl_mode` has activated CFG inference and a text
@@ -729,23 +853,54 @@ class Pi05JaxFrontendThor:
                 self._in_rl_set_prompt = False
             return
 
+        self.prompt_set_count += 1
+        self._warn_thor_mask_not_supported()
+        prompt_t0 = _time.perf_counter()
+
         CB = self._CudaBuffer
         fp16 = np.float16
 
         S = self.sig_dims[0]  # num_views * 256
+        prompt_capacity = self._state_prompt_capacity(state)
+        fixed_state = prompt_capacity is not None
         if isinstance(prompt_text, (np.ndarray, list)):
+            if state is not None:
+                raise ValueError("raw token-id prompts cannot be combined with state")
             # Raw token IDs
             token_ids = np.asarray(prompt_text, dtype=np.int64)
             prompt_len = len(token_ids)
             embeds_np = self._embedding_np[token_ids]
             embeds_np = (embeds_np * float(embeds_np.shape[-1] ** 0.5)).astype(np.float16)
         else:
-            embeds_np, prompt_len = _embed_prompt(prompt_text, self._embedding_np, max_len=48)
-        Se = S + prompt_len
+            max_len = prompt_capacity if prompt_capacity is not None else 48
+            embed_t0 = _time.perf_counter()
+            embeds_np, prompt_len = _embed_prompt(
+                prompt_text, self._embedding_np, max_len=max_len, state=state)
+            embed_t1 = _time.perf_counter()
+            self.last_prompt_timing = {
+                "thor_prompt_embed_ms": (embed_t1 - embed_t0) * 1000,
+            }
+        runtime_prompt_len = int(prompt_capacity or prompt_len)
+        Se = S + runtime_prompt_len
         if Se % 2 != 0:
             Se += 1
+            runtime_prompt_len = Se - S
+
+        if self._can_fast_update_fixed_prompt(Se, runtime_prompt_len, fixed_state):
+            self._update_fixed_prompt_buffers(
+                embeds_np, prompt_len, runtime_prompt_len, Se)
+            self.last_prompt_timing["thor_prompt_total_ms"] = (
+                _time.perf_counter() - prompt_t0) * 1000
+            self.current_prompt = prompt_text
+            logger.info(
+                "Updated fixed Thor prompt buffers: actual=%d runtime=%d Se=%d",
+                prompt_len, runtime_prompt_len, Se)
+            return
+
         self.Se = Se
         self.total_keys = Se + self.Sa
+        self.pipeline_build_count += 1
+        build_t0 = _time.perf_counter()
 
         # Stage 1.5 — build AttentionBackend. total_keys must be set first
         # (see sibling comment in frontends/torch/pi05_thor.py). Rebuilt
@@ -784,20 +939,23 @@ class Pi05JaxFrontendThor:
         )
 
         actual_lang = Se - S
-        if actual_lang > prompt_len:
-            embeds_np = np.concatenate([embeds_np, embeds_np[-1:]], axis=0)
-        self.lang_emb = CB.from_numpy(embeds_np[:actual_lang].astype(fp16))
+        embeds_np = self._pad_prompt_embeds(
+            embeds_np, prompt_len, actual_lang, fixed_state=fixed_state)
+        self.lang_emb = CB.from_numpy(embeds_np.astype(fp16))
         self.S_lang = actual_lang
+        self.current_prompt_len = int(actual_lang)
+        self.current_actual_prompt_len = int(prompt_len)
+        self.language_embed_upload_count += 1
 
         # RoPE (numpy → CudaBuffer)
         enc_rope_np = np.concatenate(
             [self._kc_t[:Se, :, None], self._ks_t[:Se, :, None]], 2).reshape(Se, 256)
         self.enc_rope = CB.from_numpy(enc_rope_np.astype(fp16))
-        dec_start = Se
-        dec_rope_np = np.concatenate(
-            [self._kc_t[dec_start:dec_start+self.Sa, :, None],
-             self._ks_t[dec_start:dec_start+self.Sa, :, None]], 2).reshape(self.Sa, 256)
+        dec_rope_np = self._decoder_rope_np(prompt_len, Se, fixed_state=fixed_state)
         self.dec_rope = CB.from_numpy(dec_rope_np.astype(fp16))
+        self.last_prompt_timing.update({
+            "thor_prompt_initial_buffer_ms": (_time.perf_counter() - build_t0) * 1000,
+        })
 
         # Time conditioning (JAX GPU — same matmuls as Thor but on GPU)
         La, Sa, Da = self.La, self.Sa, self.Da
@@ -871,6 +1029,8 @@ class Pi05JaxFrontendThor:
             self._capture_enc_ae_graph()
 
         self.current_prompt = prompt_text
+        self.last_prompt_timing["thor_prompt_total_ms"] = (
+            _time.perf_counter() - prompt_t0) * 1000
         logger.info(f"Set prompt: '{prompt_text}' (Se={Se})")
 
     def _build_enc_dicts(self, stream_int=0):

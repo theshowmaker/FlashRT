@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Check RTX Pi0.5 state-in-prompt latency with real H10W states.
+"""Check Pi0.5 state-in-prompt latency with real H10W states.
 
-The RTX path should update language embeddings when the state changes, while
-reusing the already captured pipeline for the same prompt token length. This
+The accelerated paths should update language embeddings when the state changes,
+while reusing the already captured pipeline for the same prompt token length. This
 script fixes the images and varies only state so any repeated latency spikes
 come from prompt/state handling rather than image content.
 """
@@ -198,13 +198,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--num-views", type=int, default=3)
     p.add_argument("--chunk-size", type=int, default=50)
+    p.add_argument("--hardware", default="rtx_sm89", choices=("rtx_sm89", "thor"))
     p.add_argument("--autotune", type=int, default=5)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--fixed-state-prompt-len", type=int, default=None,
                    help="Use one fixed runtime prompt length for state prompts, e.g. 200.")
     p.add_argument("--prompt-mode", default="bucketed",
                    choices=("bucketed", "fixed", "openpi_masked_fixed200"),
-                   help="Pi0.5 RTX prompt runtime mode.")
+                   help="Pi0.5 prompt runtime mode.")
     p.add_argument(
         "--threshold-ms",
         type=float,
@@ -255,7 +256,7 @@ def main() -> int:
         checkpoint=args.checkpoint,
         framework="jax",
         config="pi05",
-        hardware="rtx_sm89",
+        hardware=args.hardware,
         num_views=args.num_views,
         chunk_size=args.chunk_size,
         autotune=args.autotune,
