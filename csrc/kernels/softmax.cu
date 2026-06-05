@@ -167,6 +167,110 @@ void softmax_state_masked_fp16(__half* data, int rows, int cols,
         data, rows, cols, mask_rows, mask_start, pad_start);
 }
 
+// Prefix-padding masked softmax for Pi0.5 fixed200:
+// - Encoder rows: keep [0, valid_prefix_len), mask [valid_prefix_len, cols)
+// - Decoder rows: keep [0, valid_prefix_len) and [enc_seq_fixed, pad_start),
+//   mask [valid_prefix_len, enc_seq_fixed) and pad cols [pad_start, cols).
+__global__ void softmax_prefix_masked_fp16_kernel(
+    __half* data, int rows, int cols, const int* valid_prefix_len_ptr,
+    int enc_seq_fixed, int pad_start, bool allow_action_chunk) {
+    int lane = threadIdx.x % SM_WARP_SIZE;
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int valid_prefix_len = *valid_prefix_len_ptr;
+    if (valid_prefix_len < 1) valid_prefix_len = 1;
+    if (valid_prefix_len > pad_start) valid_prefix_len = pad_start;
+    if (enc_seq_fixed > pad_start) enc_seq_fixed = pad_start;
+
+    __half* src = data + row * cols;
+    int cols2 = cols / 2;
+    __half2* src2 = reinterpret_cast<__half2*>(src);
+
+    float reg[SM_ITERS];
+    float mx = -1e30f;
+
+    #pragma unroll
+    for (int it = 0; it < SM_ITERS / 2; it++) {
+        int c2 = it * SM_WARP_SIZE + lane;
+        if (c2 < cols2) {
+            int c_base = c2 * 2;
+            __half2 v2 = src2[c2];
+            float v0 = __half2float(v2.x);
+            float v1 = __half2float(v2.y);
+            bool mask0 = (
+                c_base >= pad_start
+                || (c_base >= valid_prefix_len
+                    && !(allow_action_chunk && c_base >= enc_seq_fixed))
+            );
+            bool mask1 = (
+                c_base + 1 >= pad_start
+                || (c_base + 1 >= valid_prefix_len
+                    && !(allow_action_chunk && c_base + 1 >= enc_seq_fixed))
+            );
+            if (mask0) v0 = -1e30f;
+            if (mask1) v1 = -1e30f;
+            reg[it*2] = v0;
+            reg[it*2+1] = v1;
+            mx = fmaxf(mx, fmaxf(v0, v1));
+        } else {
+            reg[it*2] = -1e30f;
+            reg[it*2+1] = -1e30f;
+        }
+    }
+    if ((cols & 1) && lane == 0) {
+        int c = cols - 1;
+        float v = __half2float(src[c]);
+        bool mask = (
+            c >= pad_start
+            || (c >= valid_prefix_len
+                && !(allow_action_chunk && c >= enc_seq_fixed))
+        );
+        if (mask) v = -1e30f;
+        reg[SM_ITERS-1] = v;
+        mx = fmaxf(mx, v);
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+
+    float sm = 0;
+    #pragma unroll
+    for (int it = 0; it < SM_ITERS; it++) {
+        reg[it] = __expf(reg[it] - mx);
+        sm += reg[it];
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        sm += __shfl_xor_sync(0xffffffff, sm, o);
+
+    float inv = 1.f / (sm + 1e-8f);
+    #pragma unroll
+    for (int it = 0; it < SM_ITERS / 2; it++) {
+        int c2 = it * SM_WARP_SIZE + lane;
+        if (c2 < cols2) {
+            __half2 v2;
+            v2.x = __float2half(reg[it*2] * inv);
+            v2.y = __float2half(reg[it*2+1] * inv);
+            src2[c2] = v2;
+        }
+    }
+    if ((cols & 1) && lane == 0) {
+        src[cols-1] = __float2half(reg[SM_ITERS-1] * inv);
+    }
+}
+
+void softmax_prefix_masked_fp16(__half* data, int rows, int cols,
+                                const int* valid_prefix_len,
+                                int enc_seq_fixed, int pad_start,
+                                bool allow_action_chunk,
+                                cudaStream_t stream) {
+    softmax_prefix_masked_fp16_kernel<<<rows, SM_WARP_SIZE, 0, stream>>>(
+        data, rows, cols, valid_prefix_len, enc_seq_fixed, pad_start,
+        allow_action_chunk);
+}
+
 
 // Causal softmax — strict upper-triangular masking per-head.
 // Layout: (NH * S_q, cols) row-major. For row r, head-local Q index

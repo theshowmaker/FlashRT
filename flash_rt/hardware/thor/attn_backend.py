@@ -203,6 +203,8 @@ class ThorFlashAttnBackend(AttentionBackendBase):
           * absent / ``"standard"`` → ``fvk.attention_qkv_fp16``
           * ``"state_masked"``      → ``fvk.attention_qkv_fp16_state_masked``
                                       (Pi0 decoder; requires ``state_nk``).
+          * slot ``prefix_masked``   → ``fvk.attention_qkv_fp16_prefix_masked``
+                                      (Pi0.5 fixed200 OpenPI prefix mask).
         """
         if site not in self._slots:
             raise KeyError(f"unknown site {site!r}")
@@ -240,7 +242,25 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                              # always supplies kv_seq explicitly.
 
         kernel = site_spec.extra.get("kernel", "standard")
-        if kernel == "state_masked":
+        if bool(s.get("prefix_masked", False)):
+            valid_prefix_len = int(s.get("valid_prefix_len", 0))
+            enc_seq_fixed = int(s.get("enc_seq_fixed", 0))
+            if valid_prefix_len == 0 or enc_seq_fixed == 0:
+                raise ValueError(
+                    f"site {site!r} prefix_masked requested without "
+                    "valid_prefix_len / enc_seq_fixed slots")
+            fvk.attention_qkv_fp16_prefix_masked(
+                self._ctx_cpp,
+                int(s["Q_O"]), K_ptr, V_ptr,
+                int(s["logits"]), int(s["Q_O"]),
+                q_seq, kv_seq,
+                site_spec.num_q_heads, site_spec.head_dim,
+                valid_prefix_len,
+                enc_seq_fixed,
+                site == "decoder",
+                float(s["scale"]), stream,
+            )
+        elif kernel == "state_masked":
             if state_nk is None:
                 raise ValueError(
                     f"site {site!r} uses state_masked kernel but no "
@@ -269,7 +289,7 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         else:
             raise ValueError(
                 f"unknown kernel {kernel!r} for site {site!r} "
-                f"(supported: 'standard', 'state_masked')")
+                f"(supported: 'standard', 'state_masked', prefix_masked slot)")
         return int(s["Q_O"])
 
 

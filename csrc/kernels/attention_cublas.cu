@@ -246,3 +246,52 @@ void attention_qkv_fp16_state_masked(
         out, CUDA_R_16F, HD,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
+
+// Prefix-padding masked attention for Pi0.5 fixed200.
+// Encoder: allow_action_chunk=false, masks [valid_prefix_len, S_kv).
+// Decoder: allow_action_chunk=true, masks only the middle padding band
+// [valid_prefix_len, enc_seq_fixed) and keeps action chunk keys.
+void attention_qkv_fp16_prefix_masked(
+    cublasHandle_t handle,
+    const __half* Q,
+    const __half* K,
+    const __half* V,
+    __half* logits,
+    __half* out,
+    int S, int S_kv, int NH, int HD,
+    const int* valid_prefix_len,
+    int enc_seq_fixed,
+    bool allow_action_chunk,
+    float attn_scale,
+    cudaStream_t stream)
+{
+    cublasSetStream(handle, stream);
+
+    int S_kv_pad = S_kv + (S_kv & 1);
+
+    float zero = 0.0f;
+    cublasGemmEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        S_kv, S * NH, HD,
+        &attn_scale,
+        K, CUDA_R_16F, HD,
+        Q, CUDA_R_16F, HD,
+        &zero,
+        logits, CUDA_R_16F, S_kv_pad,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+
+    softmax_prefix_masked_fp16(
+        logits, S * NH, S_kv_pad, valid_prefix_len,
+        enc_seq_fixed, S_kv, allow_action_chunk, stream);
+
+    float one = 1.0f;
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        HD, S * NH, S_kv,
+        &one,
+        V, CUDA_R_16F, HD,
+        logits, CUDA_R_16F, S_kv_pad,
+        &zero,
+        out, CUDA_R_16F, HD,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}

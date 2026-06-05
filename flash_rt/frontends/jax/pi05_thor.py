@@ -103,8 +103,10 @@ class Pi05JaxFrontendThor:
         if self.fixed_state_prompt_len is not None and self.fixed_state_prompt_len <= 0:
             raise ValueError(
                 f"fixed_state_prompt_len must be positive, got {self.fixed_state_prompt_len}")
-        # Thor currently has a fixed-shape prompt path but no general prefix
-        # padding mask in flash_rt_kernels.so. Keep metadata explicit.
+        self._requested_openpi_masked_prefix = (
+            self.prompt_mode == "openpi_masked_fixed200")
+        # Populated after flash_rt_kernels is imported; kept explicit in
+        # metadata so fallback/no-mask runs cannot masquerade as OpenPI mask.
         self.openpi_masked_prefix = False
         self.prompt_mask_supported = False
         self._thor_mask_warning_emitted = False
@@ -130,6 +132,17 @@ class Pi05JaxFrontendThor:
         self._fvk = _fvk
         self._ctx = _fvk.FvkContext()
         self._gemm = _fvk.GemmRunner()
+        self.prompt_mask_supported = bool(
+            hasattr(_fvk, "attention_qkv_fp16_prefix_masked"))
+        self.openpi_masked_prefix = (
+            self._requested_openpi_masked_prefix
+            and self.prompt_mask_supported
+        )
+        if self._requested_openpi_masked_prefix and not self.prompt_mask_supported:
+            logger.warning(
+                "prompt_mode=openpi_masked_fixed200 requested on Thor, but "
+                "flash_rt_kernels lacks attention_qkv_fp16_prefix_masked; "
+                "falling back to fixed200 no-mask.")
 
         if fmha_path is None:
             # Search order matches the torch Thor frontends: ckpt-adjacent,
@@ -191,6 +204,10 @@ class Pi05JaxFrontendThor:
         self.current_prompt = None
         self.current_prompt_len = 0
         self.current_actual_prompt_len = 0
+        self.valid_prefix_len = 0
+        self.enc_seq_fixed = 0
+        self._valid_prefix_len_buf = self._CudaBuffer.from_numpy(
+            np.array([0], dtype=np.int32))
         self.prompt_set_count = 0
         self.prompt_fast_update_count = 0
         self.pipeline_build_count = 0
@@ -773,13 +790,23 @@ class Pi05JaxFrontendThor:
              self._ks_t[dec_start:dec_start+self.Sa, :, None]], 2).reshape(self.Sa, 256)
 
     def _warn_thor_mask_not_supported(self):
-        if self.prompt_mode != "openpi_masked_fixed200" or self._thor_mask_warning_emitted:
+        if (self.prompt_mode != "openpi_masked_fixed200"
+                or self.prompt_mask_supported
+                or self._thor_mask_warning_emitted):
             return
         logger.warning(
             "prompt_mode=openpi_masked_fixed200 requested on Thor, but the Thor "
             "attention kernels do not yet support OpenPI prefix padding masks. "
             "Running fixed200 no-mask mode with stable graph shape.")
         self._thor_mask_warning_emitted = True
+
+    def _update_valid_prefix_len(self, prompt_len, enc_seq_fixed=None):
+        valid = int(self.sig_dims[0]) + int(prompt_len)
+        self.valid_prefix_len = valid
+        self.enc_seq_fixed = int(enc_seq_fixed or getattr(self, "Se", 0)) or (
+            int(self.sig_dims[0]) + int(self.fixed_state_prompt_len or prompt_len)
+        )
+        self._valid_prefix_len_buf.upload(np.array([valid], dtype=np.int32))
 
     def _can_fast_update_fixed_prompt(self, Se, runtime_prompt_len, fixed_state):
         if not fixed_state:
@@ -825,6 +852,8 @@ class Pi05JaxFrontendThor:
             "fast_state_tokenizer_cache_size": int(fast_state_tokenizer_cache_size()),
             "current_prompt_len": int(getattr(self, "current_prompt_len", 0)),
             "current_actual_prompt_len": int(getattr(self, "current_actual_prompt_len", 0)),
+            "valid_prefix_len": int(getattr(self, "valid_prefix_len", 0)),
+            "enc_seq_fixed": int(getattr(self, "enc_seq_fixed", 0)),
             "Se": int(getattr(self, "Se", 0)),
             "total_keys": int(getattr(self, "total_keys", 0)),
             "prompt_set_count": int(getattr(self, "prompt_set_count", 0)),
@@ -885,6 +914,7 @@ class Pi05JaxFrontendThor:
         if Se % 2 != 0:
             Se += 1
             runtime_prompt_len = Se - S
+        self._update_valid_prefix_len(prompt_len, enc_seq_fixed=Se)
 
         if self._can_fast_update_fixed_prompt(Se, runtime_prompt_len, fixed_state):
             self._update_fixed_prompt_buffers(
@@ -927,6 +957,9 @@ class Pi05JaxFrontendThor:
                 "logits":       self.enc_buf[2].ptr.value,
                 "layer_stride": layer_stride,
                 "scale":        attn_scale,
+                "prefix_masked": bool(self.openpi_masked_prefix),
+                "valid_prefix_len": self._valid_prefix_len_buf.ptr.value,
+                "enc_seq_fixed": Se,
             },
             decoder_slots={
                 "Q_O":          self.ae_buf[5].ptr.value,
@@ -935,6 +968,9 @@ class Pi05JaxFrontendThor:
                 "logits":       self.ae_buf[4].ptr.value,
                 "layer_stride": layer_stride,
                 "scale":        attn_scale,
+                "prefix_masked": bool(self.openpi_masked_prefix),
+                "valid_prefix_len": self._valid_prefix_len_buf.ptr.value,
+                "enc_seq_fixed": Se,
             },
         )
 
@@ -2732,7 +2768,12 @@ class Pi05JaxFrontendThor:
         if not getattr(self, "_has_exist_head", False):
             return {}
         prefix_out = self.enc_x.download_new((self.Se, self.De), np.float16).astype(np.float32)
-        pooled = prefix_out.mean(axis=0)
+        if bool(getattr(self, "openpi_masked_prefix", False)):
+            valid = int(getattr(self, "valid_prefix_len", self.Se))
+            valid = max(1, min(valid, self.Se))
+            pooled = prefix_out[:valid].mean(axis=0)
+        else:
+            pooled = prefix_out.mean(axis=0)
         w = self._exist_head_w_np.astype(np.float32, copy=False)
         b = self._exist_head_b_np.astype(np.float32, copy=False)
         if w.ndim == 2 and w.shape[0] != self.De and w.shape[1] == self.De:

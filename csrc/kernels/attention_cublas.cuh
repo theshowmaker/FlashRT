@@ -52,3 +52,20 @@ void attention_qkv_fp16_state_masked(
     int state_nk,            // number of keys visible to state token (typically enc_seq+1)
     float attn_scale,
     cudaStream_t stream = 0);
+
+// Prefix-padding masked attention for Pi0.5 fixed200.
+// valid_prefix_len is a device pointer so CUDA Graph replay observes
+// per-frame prompt/state length updates without recapture.
+void attention_qkv_fp16_prefix_masked(
+    cublasHandle_t handle,
+    const __half* Q,
+    const __half* K,
+    const __half* V,
+    __half* logits,
+    __half* out,
+    int S, int S_kv, int NH, int HD,
+    const int* valid_prefix_len,
+    int enc_seq_fixed,
+    bool allow_action_chunk,
+    float attn_scale,
+    cudaStream_t stream = 0);

@@ -27,3 +27,13 @@ void softmax_causal_fp16(__half* data, int rows, int cols,
 void softmax_state_masked_fp16(__half* data, int rows, int cols,
                                 int mask_rows, int mask_start, int pad_start,
                                 cudaStream_t stream = 0);
+
+// Prefix-padding masked softmax for Pi0.5 fixed200.
+// Masks key columns in [valid_prefix_len, enc_seq_fixed). If
+// allow_action_chunk is false, also masks everything >= valid_prefix_len.
+// Always masks pad columns at c >= pad_start.
+void softmax_prefix_masked_fp16(__half* data, int rows, int cols,
+                                const int* valid_prefix_len,
+                                int enc_seq_fixed, int pad_start,
+                                bool allow_action_chunk,
+                                cudaStream_t stream = 0);
