@@ -103,6 +103,18 @@ def parse_args() -> argparse.Namespace:
         help="Disable FP8 kernels and run the BF16 fallback path.",
     )
     parser.add_argument(
+        "--fixed-state-prompt-len",
+        type=int,
+        default=None,
+        help="Pi0.5 RTX only. Fixed runtime length for state prompts.",
+    )
+    parser.add_argument(
+        "--prompt-mode",
+        default="bucketed",
+        choices=("bucketed", "fixed", "openpi_masked_fixed200"),
+        help="Pi0.5 RTX prompt runtime mode.",
+    )
+    parser.add_argument(
         "--check-only",
         action="store_true",
         help="Only check imports, CUDA arch dispatch, and tokenizer presence.",
@@ -247,6 +259,8 @@ def main() -> int:
         recalibrate=args.recalibrate,
         weight_cache=not args.no_weight_cache,
         use_fp8=not args.no_fp8,
+        fixed_state_prompt_len=args.fixed_state_prompt_len,
+        prompt_mode=args.prompt_mode,
     )
     sync_cuda()
     print(f"model loaded in {time.perf_counter() - load_t0:.2f}s")

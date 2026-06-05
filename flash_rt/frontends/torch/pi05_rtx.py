@@ -499,11 +499,21 @@ class Pi05TorchFrontendRtx:
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
-                 fixed_state_prompt_len: Optional[int] = None):
+                 fixed_state_prompt_len: Optional[int] = None,
+                 prompt_mode: str = "bucketed"):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self.prompt_mode = str(prompt_mode or "bucketed")
+        valid_prompt_modes = {"bucketed", "fixed", "openpi_masked_fixed200"}
+        if self.prompt_mode not in valid_prompt_modes:
+            raise ValueError(
+                f"prompt_mode must be one of {sorted(valid_prompt_modes)}, "
+                f"got {self.prompt_mode!r}")
+        if self.prompt_mode == "openpi_masked_fixed200" and fixed_state_prompt_len is None:
+            fixed_state_prompt_len = PI05_STATE_PROMPT_MAX_LEN
+        self.openpi_masked_prefix = self.prompt_mode == "openpi_masked_fixed200"
         self.fixed_state_prompt_len = (
             None if fixed_state_prompt_len is None
             else int(fixed_state_prompt_len)
@@ -1104,6 +1114,7 @@ class Pi05TorchFrontendRtx:
                     num_steps=self._num_steps,
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
+                    openpi_masked_prefix=self.openpi_masked_prefix,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[runtime_prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
@@ -1145,6 +1156,12 @@ class Pi05TorchFrontendRtx:
             "current_prompt_len": int(self.current_prompt_len),
             "current_actual_prompt_len": int(self.current_actual_prompt_len),
             "fixed_state_prompt_len": (
+                None if self.fixed_state_prompt_len is None
+                else int(self.fixed_state_prompt_len)
+            ),
+            "prompt_mode": self.prompt_mode,
+            "openpi_masked_prefix": bool(self.openpi_masked_prefix),
+            "prompt_capacity": (
                 None if self.fixed_state_prompt_len is None
                 else int(self.fixed_state_prompt_len)
             ),

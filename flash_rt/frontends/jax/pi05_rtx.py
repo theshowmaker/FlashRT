@@ -51,6 +51,7 @@ from flash_rt.frontends.torch.pi05_rtx import (
     _select_fp8_layout,
 )
 from flash_rt.core.utils.hardware import supports_fp8
+from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +459,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         hardware: Optional[str] = None,
         fp8_layout: Optional[str] = None,
         fixed_state_prompt_len: Optional[int] = None,
+        prompt_mode: str = "bucketed",
     ):
         # Don't chain to Pi05TorchFrontendRtx.__init__ — it expects a safetensors
         # file. We replicate the body and swap the loader.
@@ -465,6 +467,15 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self.prompt_mode = str(prompt_mode or "bucketed")
+        valid_prompt_modes = {"bucketed", "fixed", "openpi_masked_fixed200"}
+        if self.prompt_mode not in valid_prompt_modes:
+            raise ValueError(
+                f"prompt_mode must be one of {sorted(valid_prompt_modes)}, "
+                f"got {self.prompt_mode!r}")
+        if self.prompt_mode == "openpi_masked_fixed200" and fixed_state_prompt_len is None:
+            fixed_state_prompt_len = PI05_STATE_PROMPT_MAX_LEN
+        self.openpi_masked_prefix = self.prompt_mode == "openpi_masked_fixed200"
         self.fixed_state_prompt_len = (
             None if fixed_state_prompt_len is None
             else int(fixed_state_prompt_len)

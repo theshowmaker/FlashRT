@@ -159,6 +159,7 @@ class Pi05Pipeline:
                  use_int8_encoder: bool = False,
                  use_int8_vision: bool = False,
                  use_int8_vision_static: bool = False,
+                 openpi_masked_prefix: bool = False,
                  vision_pool_factor: int = 1,
                  vision_num_layers: int = VIS_L,
                  num_steps: int = NUM_STEPS_DEFAULT):
@@ -176,6 +177,7 @@ class Pi05Pipeline:
         self.use_int8_decoder = bool(use_int8_decoder)
         self.use_int8_encoder = bool(use_int8_encoder)
         self.use_int8_vision = bool(use_int8_vision)
+        self.openpi_masked_prefix = bool(openpi_masked_prefix)
         # Static INT8 vision: uses pre-calibrated per-layer per-tensor scales.
         # Eliminates the per-row amax reduction → 1 quantize kernel vs 3.
         # Scales are collected once during calibrate_int8_vision_static().
@@ -222,6 +224,8 @@ class Pi05Pipeline:
         # Attention pointers (owned by attn_backend)
         self._attn_ptrs = attn_backend.get_ptrs()
         self._enc_kv_layer_stride = self._attn_ptrs["enc_k_layer_stride_bytes"]
+        if self.openpi_masked_prefix and hasattr(attn_backend, "enable_openpi_masked_prefix"):
+            attn_backend.enable_openpi_masked_prefix(True)
 
         # Allocate internal buffers (all CudaBuffer, all BF16 unless noted)
         self.bufs = self._allocate_buffers()
@@ -1981,6 +1985,7 @@ class Pi05Pipeline:
 
         # Update decoder RoPE slice for this prompt length
         self._set_decoder_rope_for_prompt(actual_len)
+        self._update_openpi_prefix_valid_len(actual_len)
 
         # Initial copy into encoder_x (so the FIRST calibration pass sees
         # the correct lang embeds without needing a prior forward() call).
@@ -2016,7 +2021,18 @@ class Pi05Pipeline:
                 f"actual_prompt_len must be in [1, {prompt_len}], got {actual_len}")
         self._current_prompt_len = actual_len
         self._set_decoder_rope_for_prompt(actual_len)
+        self._update_openpi_prefix_valid_len(actual_len)
         self._copy_lang_embeds_to_encoder_x(stream=stream)
+
+    def _update_openpi_prefix_valid_len(self, actual_prompt_len: int) -> None:
+        if not self.openpi_masked_prefix:
+            return
+        if not hasattr(self.attn, "update_openpi_prefix_valid_len"):
+            raise RuntimeError(
+                "openpi_masked_prefix=True requires an attention backend with "
+                "update_openpi_prefix_valid_len().")
+        self.attn.update_openpi_prefix_valid_len(
+            self.vision_seq_enc + int(actual_prompt_len))
 
     def _copy_lang_embeds_to_encoder_x(self, stream: int = 0) -> None:
         """D2D copy stored lang embeds into encoder_x[vs:vs+prompt_len]."""

@@ -310,7 +310,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                cache_frames=None,
                use_fp16=False,
                use_fp8=True,
-               fixed_state_prompt_len=None):
+               fixed_state_prompt_len=None,
+               prompt_mode="bucketed"):
     """Load a FlashRT model.
 
     Args:
@@ -395,6 +396,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         fixed_state_prompt_len: Pi0.5 RTX only. When set and ``state`` is
             passed to ``predict()``, build one fixed-length state-prompt
             runtime instead of per-token-length buckets.
+        prompt_mode: Pi0.5 RTX only. ``"bucketed"`` keeps the historical
+            per-length cache, ``"fixed"`` uses fixed_state_prompt_len without
+            attention masking, and ``"openpi_masked_fixed200"`` uses a fixed
+            200-token state prompt with OpenPI-style prefix padding masks.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -589,6 +594,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["cache_frames"] = cache_frames
         if fixed_state_prompt_len is not None and accepts_kwarg("fixed_state_prompt_len"):
             kwargs["fixed_state_prompt_len"] = fixed_state_prompt_len
+        if accepts_kwarg("prompt_mode"):
+            kwargs["prompt_mode"] = prompt_mode
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

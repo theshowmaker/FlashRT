@@ -202,6 +202,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--fixed-state-prompt-len", type=int, default=None,
                    help="Use one fixed runtime prompt length for state prompts, e.g. 200.")
+    p.add_argument("--prompt-mode", default="bucketed",
+                   choices=("bucketed", "fixed", "openpi_masked_fixed200"),
+                   help="Pi0.5 RTX prompt runtime mode.")
     p.add_argument(
         "--threshold-ms",
         type=float,
@@ -258,6 +261,7 @@ def main() -> int:
         autotune=args.autotune,
         use_fp8=args.fp8,
         fixed_state_prompt_len=args.fixed_state_prompt_len,
+        prompt_mode=args.prompt_mode,
     )
     _sync_cuda()
     print(f"model loaded in {(time.perf_counter() - t0):.2f}s")

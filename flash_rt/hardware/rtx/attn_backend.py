@@ -285,6 +285,8 @@ class RtxFlashAttnBackend:
         self._vis_out_ref = None
         self._enc_out_ref = None
         self._dec_out_ref = None
+        self._openpi_masked_prefix = False
+        self._openpi_prefix_valid_len = int(encoder_seq_max)
 
         # Lazy-import either fvk FA2 (in-SO vendored) or pip flash_attn
         # depending on the dispatch chosen above. In fvk FA2 mode we
@@ -389,6 +391,22 @@ class RtxFlashAttnBackend:
                                                     dtype=torch.float32, device=d)
             self._dec_o_accum_rows1 = torch.empty(_dec_splits, 1, 8, _rows1_sq, 256,
                                                   dtype=torch.float32, device=d)
+        if not hasattr(self, "_enc_O"):
+            self._enc_O = torch.empty(1, encoder_seq_max, 8, 256,
+                                      dtype=bf16, device=d)
+        if not hasattr(self, "_dec_O"):
+            self._dec_O = torch.empty(1, chunk_size, 8, 256,
+                                      dtype=bf16, device=d)
+        total_kv = encoder_seq_max + chunk_size
+        self._openpi_enc_mask = torch.empty(
+            1, 1, encoder_seq_max, encoder_seq_max, dtype=torch.bool, device=d)
+        self._openpi_dec_mask = torch.empty(
+            1, 1, chunk_size, total_kv, dtype=torch.bool, device=d)
+        self._openpi_enc_query_scale = torch.empty(
+            1, encoder_seq_max, 1, 1, dtype=bf16, device=d)
+        self._openpi_enc_idx = torch.arange(encoder_seq_max, device=d)
+        self._openpi_kv_idx = torch.arange(total_kv, device=d)
+        self.update_openpi_prefix_valid_len(encoder_seq_max)
         # ``flash_attn`` (the upstream pip wheel) is needed only when:
         #   - ``FVK_RTX_FA2=0`` (legacy backend), or
         #   - ``FVK_RTX_FA2_SITES`` excludes some sites during bisection.
@@ -424,6 +442,53 @@ class RtxFlashAttnBackend:
     # returned pointer is stable across CUDA graph replays and can be fed
     # directly into the next GEMM without a copy (this saves ~1.4 ms per
     # full Pi0.5 inference on RTX 5090 vs copying into a fixed O buffer).
+
+    def enable_openpi_masked_prefix(self, enabled: bool = True) -> None:
+        """Enable OpenPI-style fixed prefix padding masks for Pi0.5."""
+        self._openpi_masked_prefix = bool(enabled)
+        self.update_openpi_prefix_valid_len(self._openpi_prefix_valid_len)
+
+    def update_openpi_prefix_valid_len(self, valid_len: int) -> None:
+        """Update masks for [valid prefix][padding][action chunk] layout."""
+        import torch
+        valid_len = int(valid_len)
+        if valid_len <= 0 or valid_len > self._encoder_seq_max:
+            raise ValueError(
+                f"valid prefix length must be in [1, {self._encoder_seq_max}], "
+                f"got {valid_len}")
+        self._openpi_prefix_valid_len = valid_len
+        with torch.no_grad():
+            valid_prefix = self._openpi_enc_idx < valid_len
+            # Valid queries cannot see padded prefix keys. Padding query rows
+            # are allowed to see valid keys so SDPA stays finite, then zeroed
+            # by _openpi_enc_query_scale before the output projection.
+            self._openpi_enc_mask.copy_(valid_prefix.view(1, 1, 1, -1))
+            self._openpi_enc_query_scale.copy_(
+                valid_prefix.to(dtype=self._openpi_enc_query_scale.dtype).view(1, -1, 1, 1))
+            fixed_prefix = self._encoder_seq_max
+            valid_kv = (
+                (self._openpi_kv_idx < valid_len)
+                | (self._openpi_kv_idx >= fixed_prefix)
+            )
+            self._openpi_dec_mask.copy_(valid_kv.view(1, 1, 1, -1))
+
+    def _sdpa_openpi(self, q, k, v, mask, o, query_scale=None) -> int:
+        import torch.nn.functional as F
+        qh = q.transpose(1, 2)
+        kh = k.transpose(1, 2)
+        vh = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            qh, kh, vh,
+            attn_mask=mask,
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=(qh.shape[1] != kh.shape[1]),
+        )
+        out = out.transpose(1, 2)
+        if query_scale is not None:
+            out = out * query_scale[:, :out.shape[1]]
+        o.copy_(out)
+        return o.data_ptr()
 
     def _call_fvk_fa2(self, q, k, v, o, lse, *, stream: int = 0,
                        softmax_scale=None,
@@ -490,6 +555,11 @@ class RtxFlashAttnBackend:
         q = self.enc_Q[:seq].unsqueeze(0)                # (1, seq, 8, 256)
         k = self.enc_K[layer_idx, :seq].unsqueeze(0)     # (1, seq, 1, 256)
         v = self.enc_V[layer_idx, :seq].unsqueeze(0)     # (1, seq, 1, 256)
+        if self._openpi_masked_prefix:
+            o = self._enc_O[:, :seq]
+            mask = self._openpi_enc_mask[:, :, :seq, :seq]
+            return self._sdpa_openpi(
+                q, k, v, mask, o, query_scale=self._openpi_enc_query_scale)
         if self._fa2_sites["encoder"]:
             o = self._enc_O[:, :seq].contiguous()
             self._call_fvk_fa2(q, k, v, o, self._enc_lse, stream=stream,
@@ -506,6 +576,10 @@ class RtxFlashAttnBackend:
         q = self.dec_Q[:dec_seq].unsqueeze(0)                # (1, chunk, 8, 256)
         k = self.enc_K[layer_idx, :total_kv].unsqueeze(0)    # (1, total, 1, 256)
         v = self.enc_V[layer_idx, :total_kv].unsqueeze(0)    # (1, total, 1, 256)
+        if self._openpi_masked_prefix:
+            o = self._dec_O[:, :dec_seq]
+            mask = self._openpi_dec_mask[:, :, :dec_seq, :total_kv]
+            return self._sdpa_openpi(q, k, v, mask, o)
         if self._fa2_sites["decoder"]:
             o = self._dec_O[:, :dec_seq].contiguous()
             self._call_fvk_fa2(q, k, v, o, self._dec_lse, stream=stream,

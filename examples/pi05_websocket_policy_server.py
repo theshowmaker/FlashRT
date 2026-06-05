@@ -116,6 +116,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-state-prompt-len", type=int, default=None,
                         help="Pi0.5 RTX: use one fixed state-prompt runtime length "
                              "(for OpenPI-like fixed-shape serving, use 200).")
+    parser.add_argument("--prompt-mode", default="bucketed",
+                        choices=["bucketed", "fixed", "openpi_masked_fixed200"],
+                        help="Pi0.5 RTX prompt runtime mode. openpi_masked_fixed200 "
+                             "uses fixed 200-token state prompts plus OpenPI-style "
+                             "prefix padding masks.")
     parser.add_argument("--no-h10w-dual-absolute-actions", action="store_true",
                         help="Return raw normalized/unnormalized model actions without H10W dual AbsoluteActions().")
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
@@ -245,6 +250,7 @@ class FlashRTPi05Policy:
             vision_num_layers=args.vision_num_layers,
             use_fp8=bool(args.use_fp8),
             fixed_state_prompt_len=args.fixed_state_prompt_len,
+            prompt_mode=args.prompt_mode,
         )
         self.load_s = time.perf_counter() - t0
         self._printed_obs_keys = False
@@ -273,6 +279,10 @@ class FlashRTPi05Policy:
             self.action_shape = tuple(int(v) for v in actions.shape)
 
     def metadata(self) -> dict:
+        pipe = getattr(self.model, "_pipe", None)
+        fixed_len = getattr(pipe, "fixed_state_prompt_len", self.args.fixed_state_prompt_len)
+        prompt_mode = getattr(pipe, "prompt_mode", self.args.prompt_mode)
+        openpi_masked = bool(getattr(pipe, "openpi_masked_prefix", False))
         return {
             "model": "pi05",
             "framework": self.args.framework,
@@ -282,7 +292,10 @@ class FlashRTPi05Policy:
             "force_bf16": os.environ.get("FVK_PI05_RTX_FORCE_BF16") == "1",
             "use_fp4": self.args.use_fp4,
             "cache_frames": self.args.cache_frames,
-            "fixed_state_prompt_len": self.args.fixed_state_prompt_len,
+            "fixed_state_prompt_len": fixed_len,
+            "prompt_mode": prompt_mode,
+            "prompt_capacity": fixed_len,
+            "openpi_masked_prefix": openpi_masked,
             "load_s": self.load_s,
             "action_shape": list(self.action_shape or (self.args.chunk_size, -1)),
         }

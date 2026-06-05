@@ -85,6 +85,11 @@ def main():
                              "baseline (no FP8 quantization, no calibration) "
                              "as an A/B precision reference. Requires "
                              "hardware in {rtx_sm120, rtx_sm89}.")
+    parser.add_argument('--fixed_state_prompt_len', type=int, default=None,
+                        help="Pi0.5 RTX only. Fixed runtime length for state prompts.")
+    parser.add_argument('--prompt_mode', default='bucketed',
+                        choices=['bucketed', 'fixed', 'openpi_masked_fixed200'],
+                        help="Pi0.5 RTX prompt runtime mode.")
     args = parser.parse_args()
 
     # ══════════════════════════════════════════
@@ -107,6 +112,8 @@ def main():
         use_fp4=args.use_fp4,
         use_fp16=args.use_fp16,
         use_fp8=not args.use_fp16,
+        fixed_state_prompt_len=args.fixed_state_prompt_len,
+        prompt_mode=args.prompt_mode,
     )
 
     img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
