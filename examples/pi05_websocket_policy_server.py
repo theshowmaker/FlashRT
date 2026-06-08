@@ -118,10 +118,9 @@ def parse_args() -> argparse.Namespace:
                              "(for OpenPI-like fixed-shape serving, use 200).")
     parser.add_argument("--prompt-mode", default="bucketed",
                         choices=["bucketed", "fixed", "openpi_masked_fixed200"],
-                        help="Pi0.5 prompt runtime mode. On RTX, openpi_masked_fixed200 "
+                        help="Pi0.5 prompt runtime mode. openpi_masked_fixed200 "
                              "uses fixed 200-token state prompts plus OpenPI-style "
-                             "prefix padding masks. On Thor, it currently uses the "
-                             "fixed 200-token shape without prefix-mask kernels.")
+                             "prefix padding masks on supported RTX/Thor builds.")
     parser.add_argument("--no-h10w-dual-absolute-actions", action="store_true",
                         help="Return raw normalized/unnormalized model actions without H10W dual AbsoluteActions().")
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
