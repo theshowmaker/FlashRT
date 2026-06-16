@@ -121,6 +121,14 @@ def parse_args() -> argparse.Namespace:
                         help="Pi0.5 prompt runtime mode. openpi_masked_fixed200 "
                              "uses fixed 200-token state prompts plus OpenPI-style "
                              "prefix padding masks on supported RTX/Thor builds.")
+    parser.add_argument("--policy-profile", default="auto",
+                        choices=["auto", "none", "pi05_dvt2_fft_0605"],
+                        help="Policy-side profile. auto enables DVT2/System2 heads "
+                             "when detected in train_config_full.json.")
+    parser.add_argument("--robot-type", default="auto",
+                        choices=["auto", "none", "dvt2"],
+                        help="DVT2 enables H10W dual joint-limit clamping. auto "
+                             "uses dvt2 when the DVT2 policy profile is active.")
     parser.add_argument("--no-h10w-dual-absolute-actions", action="store_true",
                         help="Return raw normalized/unnormalized model actions without H10W dual AbsoluteActions().")
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
@@ -251,6 +259,7 @@ class FlashRTPi05Policy:
             use_fp8=bool(args.use_fp8),
             fixed_state_prompt_len=args.fixed_state_prompt_len,
             prompt_mode=args.prompt_mode,
+            policy_profile=args.policy_profile,
         )
         self.load_s = time.perf_counter() - t0
         self._printed_obs_keys = False
@@ -261,6 +270,7 @@ class FlashRTPi05Policy:
         state = None
         if self.args.state_dim > 0 and not self.args.ignore_state:
             state = np.zeros((self.args.state_dim,), dtype=np.float32)
+        pipe = getattr(self.model, "_pipe", None)
         for i in range(max(0, self.args.warmup)):
             t0 = time.perf_counter()
             actions = self.model.predict(
@@ -277,10 +287,13 @@ class FlashRTPi05Policy:
                 bool(np.isfinite(actions).all()),
             )
             self.action_shape = tuple(int(v) for v in actions.shape)
+        if pipe is not None and hasattr(pipe, "reset_dvt2_tracker"):
+            pipe.reset_dvt2_tracker()
 
     def metadata(self) -> dict:
         pipe = getattr(self.model, "_pipe", None)
         fixed_len = getattr(pipe, "fixed_state_prompt_len", self.args.fixed_state_prompt_len)
+        prompt_capacity = getattr(pipe, "max_prompt_len", fixed_len)
         prompt_mode = getattr(pipe, "prompt_mode", self.args.prompt_mode)
         openpi_masked = bool(getattr(pipe, "openpi_masked_prefix", False))
         prompt_mask_supported = bool(getattr(pipe, "prompt_mask_supported", openpi_masked))
@@ -290,6 +303,9 @@ class FlashRTPi05Policy:
             "model": "pi05",
             "framework": self.args.framework,
             "hardware": self.args.hardware,
+            "policy_profile": getattr(pipe, "policy_profile_name", self.args.policy_profile),
+            "dvt2_profile": bool(getattr(pipe, "_dvt2_enabled", False)),
+            "robot_type": self._effective_robot_type(),
             "num_views": self.args.num_views,
             "checkpoint": self.args.checkpoint,
             "force_bf16": os.environ.get("FVK_PI05_RTX_FORCE_BF16") == "1",
@@ -297,13 +313,25 @@ class FlashRTPi05Policy:
             "cache_frames": self.args.cache_frames,
             "fixed_state_prompt_len": fixed_len,
             "prompt_mode": prompt_mode,
-            "prompt_capacity": fixed_len,
+            "prompt_capacity": prompt_capacity,
             "openpi_masked_prefix": openpi_masked,
             "prompt_mask_supported": prompt_mask_supported,
+            "dvt2_materialize_encoder_output": bool(
+                getattr(pipe, "pipeline", None) is not None
+                and getattr(getattr(pipe, "pipeline", None), "materialize_encoder_output", False)
+            ),
+            "dvt2_openpi_fixed_hole_rope": bool(getattr(pipe, "_dvt2_enabled", False)),
             "fast_state_tokenizer": fast_state_tokenizer,
             "load_s": self.load_s,
             "action_shape": list(self.action_shape or (self.args.chunk_size, -1)),
         }
+
+    def _effective_robot_type(self) -> str:
+        robot_type = str(self.args.robot_type)
+        if robot_type == "auto":
+            pipe = getattr(self.model, "_pipe", None)
+            return "dvt2" if bool(getattr(pipe, "_dvt2_enabled", False)) else "none"
+        return robot_type
 
     def infer(self, obs: dict) -> dict:
         if self.args.log_obs_keys_once and not self._printed_obs_keys:
@@ -314,6 +342,14 @@ class FlashRTPi05Policy:
         prompt = str(obs.get("prompt") or self.args.prompt)
         images = _extract_images(obs, self.args.num_views)
         state = None if self.args.ignore_state else _extract_state(obs)
+        pipe = getattr(self.model, "_pipe", None)
+        frame_index = obs.get("frame_index")
+        try:
+            is_first_frame = frame_index is not None and int(np.asarray(frame_index).item()) == 0
+        except Exception:
+            is_first_frame = False
+        if is_first_frame and pipe is not None and hasattr(pipe, "reset_dvt2_tracker"):
+            pipe.reset_dvt2_tracker()
         prep_ms = (time.perf_counter() - prep_t0) * 1000
 
         infer_t0 = time.perf_counter()
@@ -322,6 +358,12 @@ class FlashRTPi05Policy:
         model_timing = getattr(self.model, "last_timing", {}) or {}
         if state is not None and not self.args.no_h10w_dual_absolute_actions:
             actions = _h10w_dual_absolute_actions(actions, state)
+        actions = np.asarray(actions, dtype=np.float32)
+        if bool(getattr(pipe, "_dvt2_enabled", False)):
+            actions = actions[:, :16]
+        if self._effective_robot_type() == "dvt2":
+            from flash_rt.core.utils.dvt2_policy import clamp_h10w_dvt2_actions
+            actions = clamp_h10w_dvt2_actions(actions)
         infer_ms = (time.perf_counter() - infer_t0) * 1000
 
         policy_timing = {
@@ -338,6 +380,11 @@ class FlashRTPi05Policy:
             response["exist"] = _numpy_scalar(model_result["exist"], np.int32)
         if "exist_prob" in model_result:
             response["exist_prob"] = _numpy_scalar(model_result["exist_prob"], np.float32)
+        for key in ("subtask_logits", "predicted_stage", "stage"):
+            if key in model_result:
+                response[key] = np.asarray(model_result[key])
+        if "dvt2_debug" in model_result:
+            response["dvt2_debug"] = model_result["dvt2_debug"]
         return response
 
 

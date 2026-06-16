@@ -314,7 +314,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp16=False,
                use_fp8=True,
                fixed_state_prompt_len=None,
-               prompt_mode="bucketed"):
+               prompt_mode="bucketed",
+               policy_profile="auto"):
     """Load a FlashRT model.
 
     Args:
@@ -403,6 +404,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             per-length cache, ``"fixed"`` uses fixed_state_prompt_len without
             attention masking, and ``"openpi_masked_fixed200"`` uses a fixed
             200-token state prompt with OpenPI-style prefix padding masks.
+        policy_profile: Pi0.5 RTX only. ``"auto"`` detects DVT2/System2
+            checkpoints from ``train_config_full.json``; ``"none"`` disables
+            policy-side heads; ``"pi05_dvt2_fft_0605"`` forces the DVT2 profile.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -599,6 +603,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["fixed_state_prompt_len"] = fixed_state_prompt_len
         if accepts_kwarg("prompt_mode"):
             kwargs["prompt_mode"] = prompt_mode
+        if accepts_kwarg("policy_profile"):
+            kwargs["policy_profile"] = policy_profile
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

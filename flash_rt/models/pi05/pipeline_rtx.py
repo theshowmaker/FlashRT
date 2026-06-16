@@ -160,6 +160,7 @@ class Pi05Pipeline:
                  use_int8_vision: bool = False,
                  use_int8_vision_static: bool = False,
                  openpi_masked_prefix: bool = False,
+                 materialize_encoder_output: bool = False,
                  vision_pool_factor: int = 1,
                  vision_num_layers: int = VIS_L,
                  num_steps: int = NUM_STEPS_DEFAULT):
@@ -178,6 +179,7 @@ class Pi05Pipeline:
         self.use_int8_encoder = bool(use_int8_encoder)
         self.use_int8_vision = bool(use_int8_vision)
         self.openpi_masked_prefix = bool(openpi_masked_prefix)
+        self.materialize_encoder_output = bool(materialize_encoder_output)
         # Static INT8 vision: uses pre-calibrated per-layer per-tensor scales.
         # Eliminates the per-row amax reduction → 1 quantize kernel vs 3.
         # Scales are collected once during calibrate_int8_vision_static().
@@ -1128,6 +1130,12 @@ class Pi05Pipeline:
         fused = use_fp8 and self.fp8_calibrated
         for i in range(ENC_L):
             self._encoder_layer(i, seq, fuse_b1=(i > 0 and fused), stream=stream)
+        if self.materialize_encoder_output:
+            fvk.rms_norm(
+                B["encoder_x"].ptr.value,
+                W["encoder_final_norm_w"],
+                B["encoder_x_norm"].ptr.value,
+                seq, ENC_D, 1e-6, stream=stream)
 
     def _encoder_layer(self, i: int, seq: int, fuse_b1: bool, stream: int) -> None:
         """One Gemma-2B encoder layer."""
@@ -1205,7 +1213,7 @@ class Pi05Pipeline:
             seq, ENC_NH * ENC_HD, ENC_NKV * ENC_HD, ENC_NKV * ENC_HD,
             ENC_HD, stream=stream)
 
-        if i == ENC_L - 1:
+        if i == ENC_L - 1 and not self.materialize_encoder_output:
             # Last layer: no post-attn projection/FFN needed — encoder output is
             # the K/V cache which the decoder reads. Skip to next phase.
             return
@@ -2033,6 +2041,57 @@ class Pi05Pipeline:
                 "update_openpi_prefix_valid_len().")
         self.attn.update_openpi_prefix_valid_len(
             self.vision_seq_enc + int(actual_prompt_len))
+
+    def set_openpi_stage_fusion_mask(
+        self,
+        actual_prompt_len: int,
+        prompt_capacity: int,
+        fusion_tokens: int,
+    ) -> None:
+        if not self.openpi_masked_prefix:
+            return
+        if not hasattr(self.attn, "update_openpi_prefix_stage_fusion_mask"):
+            raise RuntimeError(
+                "DVT2 stage fusion requires an attention backend with "
+                "update_openpi_prefix_stage_fusion_mask().")
+        self.attn.update_openpi_prefix_stage_fusion_mask(
+            self.vision_seq_enc + int(actual_prompt_len),
+            self.vision_seq_enc + int(prompt_capacity),
+            int(fusion_tokens),
+        )
+        self._set_openpi_stage_fusion_encoder_rope(
+            int(actual_prompt_len),
+            int(prompt_capacity),
+            int(fusion_tokens),
+        )
+
+    def _set_openpi_stage_fusion_encoder_rope(
+        self,
+        actual_prompt_len: int,
+        prompt_capacity: int,
+        fusion_tokens: int,
+    ) -> None:
+        """Update encoder RoPE positions for OpenPI fixed-prompt padding holes."""
+        prefix_before_padding = self.vision_seq_enc + int(actual_prompt_len)
+        fusion_start = self.vision_seq_enc + int(prompt_capacity)
+        fusion_end = fusion_start + int(fusion_tokens)
+        if not (0 < prefix_before_padding <= fusion_start <= fusion_end <= self.encoder_seq_len):
+            raise ValueError(
+                "invalid DVT2 RoPE layout: "
+                f"prefix_before_padding={prefix_before_padding}, "
+                f"fusion_start={fusion_start}, fusion_end={fusion_end}, "
+                f"encoder_seq_len={self.encoder_seq_len}"
+            )
+        positions = np.arange(self.encoder_seq_len, dtype=np.int64)
+        if fusion_start > prefix_before_padding:
+            positions[prefix_before_padding:fusion_start] = max(prefix_before_padding - 1, 0)
+        positions[fusion_start:fusion_end] = np.arange(
+            prefix_before_padding,
+            prefix_before_padding + int(fusion_tokens),
+            dtype=np.int64,
+        )
+        self.bufs["encoder_rope_weights"].upload(
+            np.ascontiguousarray(self._rope_table_np[positions]))
 
     def _copy_lang_embeds_to_encoder_x(self, stream: int = 0) -> None:
         """D2D copy stored lang embeds into encoder_x[vs:vs+prompt_len]."""

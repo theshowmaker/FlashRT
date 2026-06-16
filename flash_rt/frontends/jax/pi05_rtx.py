@@ -52,6 +52,11 @@ from flash_rt.frontends.torch.pi05_rtx import (
 )
 from flash_rt.core.utils.hardware import supports_fp8
 from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN
+from flash_rt.core.utils.dvt2_policy import (
+    PROFILE_DVT2_0605,
+    DVT2Profile,
+    resolve_policy_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +281,8 @@ def convert_pi05_orbax(
     ckpt["encoder_ffn_gate_w"] = _to_bf16_cuda(np.stack(enc_gate_list))
     ckpt["encoder_ffn_up_w"] = _to_bf16_cuda(np.stack(enc_up_list))
     ckpt["encoder_ffn_down_w"] = _to_bf16_cuda(np.stack(enc_down_list))
+    ckpt["encoder_final_norm_w"] = _to_bf16_cuda(
+        1.0 + raw["PaliGemma.llm.final_norm.scale"].astype(np.float32))
 
     # ── Decoder (18 Gemma-300M expert layers) ──
     dec_qkv_list, dec_o_list = [], []
@@ -405,6 +412,33 @@ def convert_pi05_orbax(
         ckpt["exist_head_w"] = _to_bf16_cuda(raw["exist_head.kernel"])
         ckpt["exist_head_b"] = _to_bf16_cuda(raw["exist_head.bias"])
 
+    def add_linear(prefix: str, out_prefix: str) -> None:
+        k_w = f"{prefix}.kernel"
+        k_b = f"{prefix}.bias"
+        if k_w in raw and k_b in raw:
+            ckpt[f"{out_prefix}_w"] = _to_bf16_cuda(raw[k_w])
+            ckpt[f"{out_prefix}_b"] = _to_bf16_cuda(raw[k_b])
+
+    def add_embed(prefix: str, out_key: str) -> None:
+        key = f"{prefix}.embedding"
+        if key in raw:
+            ckpt[out_key] = _to_bf16_cuda(raw[key])
+
+    # ── Optional DVT2/System2 policy heads ──
+    add_embed("stage_task_embed", "stage_task_embed")
+    add_linear("stage_mlp_1", "stage_mlp_1")
+    add_linear("stage_mlp_2", "stage_mlp_2")
+    add_linear("exist_mlp_1", "exist_mlp_1")
+    add_linear("exist_mlp_2", "exist_mlp_2")
+    add_embed("stage_class_embeddings", "stage_class_embeddings")
+    add_embed("task_stage_embeddings", "task_stage_embeddings")
+    add_linear("gate_sincos", "gate_sincos")
+    add_linear("gate_task_stage", "gate_task_stage")
+    add_linear("gate_task", "gate_task")
+    add_linear("fusion_layer1", "fusion_layer1")
+    add_linear("fusion_layer2", "fusion_layer2")
+    add_linear("stage_projection", "stage_projection")
+
     # ── Embedding matrix (for prompt tokenisation) ──
     # JAX stores the input embedding under PaliGemma.llm.embedder, the lm_head
     # is tied to it. For prompt embedding we use the input embedder.
@@ -460,10 +494,18 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         fp8_layout: Optional[str] = None,
         fixed_state_prompt_len: Optional[int] = None,
         prompt_mode: str = "bucketed",
+        policy_profile: str = "auto",
     ):
         # Don't chain to Pi05TorchFrontendRtx.__init__ — it expects a safetensors
         # file. We replicate the body and swap the loader.
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        self.policy_profile_name = str(policy_profile or "auto")
+        self.dvt2_profile: Optional[DVT2Profile] = resolve_policy_profile(
+            self.policy_profile_name, checkpoint_dir
+        )
+        self._dvt2_enabled = self.dvt2_profile is not None
+        if self._dvt2_enabled:
+            logger.info("Enabled Pi0.5 DVT2 policy profile (%s)", PROFILE_DVT2_0605)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
@@ -485,6 +527,13 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
                 raise ValueError(
                     f"fixed_state_prompt_len must be positive, got {self.fixed_state_prompt_len}")
             self.max_prompt_len = max(self.max_prompt_len, self.fixed_state_prompt_len)
+        if self._dvt2_enabled:
+            if self.fixed_state_prompt_len is None:
+                self.fixed_state_prompt_len = PI05_STATE_PROMPT_MAX_LEN
+            self.max_prompt_len = max(
+                self.max_prompt_len,
+                self.fixed_state_prompt_len + self.dvt2_profile.stage_fusion_num_tokens,
+            )
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
         if self._num_steps <= 0:
@@ -496,6 +545,9 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self._cache_frames = int(cache_frames)
         if self._cache_frames < 1:
             raise ValueError(f"cache_frames must be >= 1, got {self._cache_frames}")
+        if self._dvt2_enabled and self._cache_frames != 1:
+            logger.warning("DVT2 policy profile requires per-frame prefix heads; forcing cache_frames=1")
+            self._cache_frames = 1
         self._frame_count = 0
         self._vision_num_layers = (
             VIS_L if vision_num_layers is None else int(vision_num_layers)
@@ -554,6 +606,22 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.embedding_weight = self._ckpt_bf16["embedding_weight"]
         self._exist_head_w = self._ckpt_bf16.get("exist_head_w")
         self._exist_head_b = self._ckpt_bf16.get("exist_head_b")
+        self._dvt2_weights = self._collect_dvt2_weights()
+        if self._dvt2_enabled and self._dvt2_weights is None:
+            raise ValueError(
+                "DVT2 policy profile is enabled, but the checkpoint is missing "
+                "one or more stage/exist/fusion head weights."
+            )
+        self._dvt2_base_prompt_embeds: Optional[torch.Tensor] = None
+        self._dvt2_prompt_len = 0
+        self._dvt2_runtime_prompt_len = 0
+        self._dvt2_task_category = 0
+        self._dvt2_tracker_task_category: Optional[int] = None
+        self._dvt2_current_stage = 0
+        self._dvt2_uploaded_stage: Optional[int] = None
+        self._dvt2_uploaded_task_category: Optional[int] = None
+        self._dvt2_prefix_out: Optional[torch.Tensor] = None
+        self._dvt2_last_result: dict = {}
         self._exist_encoder_out: Optional[torch.Tensor] = None
         self._has_exist_head = (
             isinstance(self._exist_head_w, torch.Tensor)

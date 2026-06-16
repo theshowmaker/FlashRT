@@ -34,6 +34,17 @@ import torch
 import torch.nn.functional as F
 
 from flash_rt.core.utils.actions import unnormalize_actions
+from flash_rt.core.utils.dvt2_policy import (
+    PROFILE_DVT2_0605,
+    DVT2Profile,
+    exist_prediction_torch,
+    make_stage_fusion_tokens_torch,
+    normalize_stage,
+    num_stages_for_category,
+    resolve_policy_profile,
+    stage_logits_torch,
+    task_category_from_prompt,
+)
 from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
 from flash_rt.models.pi05.pipeline_rtx import (
     Pi05Pipeline,
@@ -231,6 +242,11 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     ckpt["encoder_ffn_gate_w"] = torch.stack(enc_gate_list)
     ckpt["encoder_ffn_up_w"] = torch.stack(enc_up_list)
     ckpt["encoder_ffn_down_w"] = torch.stack(enc_down_list)
+    norm_key = "paligemma_with_expert.paligemma.model.language_model.norm.weight"
+    if has(norm_key):
+        ckpt["encoder_final_norm_w"] = (1.0 + g_raw(norm_key).float()).to(bf16)
+    else:
+        ckpt["encoder_final_norm_w"] = torch.ones(ENC_D, dtype=bf16)
 
     # ── Decoder (18 Gemma-300M layers) ──
     dp = "paligemma_with_expert.gemma_expert.model.layers"
@@ -500,8 +516,16 @@ class Pi05TorchFrontendRtx:
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
                  fixed_state_prompt_len: Optional[int] = None,
-                 prompt_mode: str = "bucketed"):
+                 prompt_mode: str = "bucketed",
+                 policy_profile: str = "auto"):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        self.policy_profile_name = str(policy_profile or "auto")
+        self.dvt2_profile: Optional[DVT2Profile] = resolve_policy_profile(
+            self.policy_profile_name, checkpoint_dir
+        )
+        self._dvt2_enabled = self.dvt2_profile is not None
+        if self._dvt2_enabled:
+            logger.info("Enabled Pi0.5 DVT2 policy profile (%s)", PROFILE_DVT2_0605)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
@@ -523,6 +547,13 @@ class Pi05TorchFrontendRtx:
                 raise ValueError(
                     f"fixed_state_prompt_len must be positive, got {self.fixed_state_prompt_len}")
             self.max_prompt_len = max(self.max_prompt_len, self.fixed_state_prompt_len)
+        if self._dvt2_enabled:
+            if self.fixed_state_prompt_len is None:
+                self.fixed_state_prompt_len = PI05_STATE_PROMPT_MAX_LEN
+            self.max_prompt_len = max(
+                self.max_prompt_len,
+                self.fixed_state_prompt_len + self.dvt2_profile.stage_fusion_num_tokens,
+            )
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
         if self._num_steps <= 0:
@@ -538,6 +569,9 @@ class Pi05TorchFrontendRtx:
         self._cache_frames = int(cache_frames)
         if self._cache_frames < 1:
             raise ValueError(f"cache_frames must be >= 1, got {self._cache_frames}")
+        if self._dvt2_enabled and self._cache_frames != 1:
+            logger.warning("DVT2 policy profile requires per-frame prefix heads; forcing cache_frames=1")
+            self._cache_frames = 1
         self._frame_count = 0
         from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
         self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
@@ -618,6 +652,23 @@ class Pi05TorchFrontendRtx:
         self.embedding_weight = self._ckpt_bf16["embedding_weight"]
         self._exist_head_w = self._ckpt_bf16.get("exist_head_w")
         self._exist_head_b = self._ckpt_bf16.get("exist_head_b")
+        self._dvt2_weights = self._collect_dvt2_weights()
+        if self._dvt2_enabled and self._dvt2_weights is None:
+            raise ValueError(
+                "DVT2 policy profile is enabled, but the checkpoint is missing "
+                "one or more stage/exist/fusion head weights."
+            )
+        self._dvt2_base_prompt_embeds: Optional[torch.Tensor] = None
+        self._dvt2_prompt_len = 0
+        self._dvt2_runtime_prompt_len = 0
+        self._dvt2_task_category = 0
+        self._dvt2_tracker_task_category: Optional[int] = None
+        self._dvt2_current_stage = 0
+        self._dvt2_uploaded_stage: Optional[int] = None
+        self._dvt2_uploaded_task_category: Optional[int] = None
+        self._dvt2_prefix_out: Optional[torch.Tensor] = None
+        self._dvt2_last_result: dict = {}
+        self._dvt2_last_debug: dict = {}
         self._exist_encoder_out: Optional[torch.Tensor] = None
         self._has_exist_head = (
             isinstance(self._exist_head_w, torch.Tensor)
@@ -740,6 +791,188 @@ class Pi05TorchFrontendRtx:
             "use_int8_vision": False,
             "use_int8_vision_static": False,
         }
+
+    def _collect_dvt2_weights(self) -> Optional[dict]:
+        required = (
+            "stage_task_embed",
+            "stage_mlp_1_w", "stage_mlp_1_b",
+            "stage_mlp_2_w", "stage_mlp_2_b",
+            "exist_mlp_1_w", "exist_mlp_1_b",
+            "exist_mlp_2_w", "exist_mlp_2_b",
+            "stage_class_embeddings",
+            "task_stage_embeddings",
+            "gate_sincos_w", "gate_sincos_b",
+            "gate_task_stage_w", "gate_task_stage_b",
+            "gate_task_w", "gate_task_b",
+            "fusion_layer1_w", "fusion_layer1_b",
+            "fusion_layer2_w", "fusion_layer2_b",
+            "stage_projection_w", "stage_projection_b",
+        )
+        if not self._dvt2_enabled:
+            return None
+        missing = [k for k in required if k not in self._ckpt_bf16]
+        if missing:
+            logger.error("Missing DVT2 policy weights: %s", missing)
+            return None
+        return {k: self._ckpt_bf16[k] for k in required}
+
+    def _dvt2_reset_tracker_if_needed(self, task_category: int) -> None:
+        if self._dvt2_tracker_task_category != int(task_category):
+            self._dvt2_tracker_task_category = int(task_category)
+            self._dvt2_current_stage = 0
+            self._dvt2_uploaded_stage = None
+            self._dvt2_uploaded_task_category = None
+
+    def _normalize_state_for_prompt(self, state):
+        """Match OpenPI Normalize(use_quantiles=True) before Pi0.5 prompt tokenization."""
+        if state is None:
+            return None
+        arr = np.asarray(state, dtype=np.float32).reshape(-1)
+        state_stats = self.norm_stats.get("state", {}) if isinstance(self.norm_stats, dict) else {}
+        q01 = state_stats.get("q01")
+        q99 = state_stats.get("q99")
+        if q01 is None or q99 is None:
+            return arr
+        q01_arr = np.asarray(q01, dtype=np.float32).reshape(-1)
+        q99_arr = np.asarray(q99, dtype=np.float32).reshape(-1)
+        n = min(arr.size, q01_arr.size, q99_arr.size)
+        out = arr.copy()
+        if n > 0:
+            out[:n] = (out[:n] - q01_arr[:n]) / (q99_arr[:n] - q01_arr[:n] + 1e-6) * 2.0 - 1.0
+        return out.astype(np.float32, copy=False)
+
+    def reset_dvt2_tracker(self) -> None:
+        """Reset DVT2 stage tracking without changing the current prompt."""
+        if not self._dvt2_enabled:
+            return
+        self._dvt2_current_stage = 0
+        self._dvt2_uploaded_stage = None
+        self._dvt2_uploaded_task_category = None
+        debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
+        debug["reset_dvt2_tracker"] = True
+        self._dvt2_last_debug = debug
+
+    def _dvt2_make_conditioned_embeds(self) -> tuple[torch.Tensor, int]:
+        if not self._dvt2_enabled or self._dvt2_weights is None:
+            raise RuntimeError("DVT2 profile is not active")
+        if self._dvt2_base_prompt_embeds is None:
+            raise RuntimeError("set_prompt must be called before DVT2 prompt upload")
+        profile = self.dvt2_profile
+        base = self._dvt2_base_prompt_embeds
+        fusion = make_stage_fusion_tokens_torch(
+            base,
+            self._dvt2_task_category,
+            self._dvt2_current_stage,
+            self._dvt2_weights,
+            profile,
+        )
+        prompt_capacity = int(self.fixed_state_prompt_len or self._dvt2_prompt_len)
+        fusion_start = prompt_capacity
+        valid_len = int(base.shape[0]) + int(profile.stage_fusion_num_tokens)
+        runtime_len = self._dvt2_runtime_prompt_len
+        if runtime_len < fusion_start + int(profile.stage_fusion_num_tokens):
+            raise ValueError(
+                f"DVT2 runtime prompt length {runtime_len} is smaller than "
+                f"fusion end {fusion_start + int(profile.stage_fusion_num_tokens)}"
+            )
+        embeds = base.new_zeros((runtime_len, base.shape[1]))
+        embeds[: base.shape[0]].copy_(base)
+        embeds[fusion_start : fusion_start + int(profile.stage_fusion_num_tokens)].copy_(fusion)
+        return embeds.contiguous(), valid_len
+
+    def _dvt2_upload_conditioned_prompt_if_needed(self) -> None:
+        if not self._dvt2_enabled:
+            return
+        if (
+            self._dvt2_uploaded_stage == self._dvt2_current_stage
+            and self._dvt2_uploaded_task_category == self._dvt2_task_category
+        ):
+            return
+        embeds, valid_len = self._dvt2_make_conditioned_embeds()
+        if not hasattr(self.pipeline, "set_language_embeds_torch"):
+            embeds_np = embeds.view(torch.uint16).cpu().numpy()
+            self.pipeline.set_language_embeds(embeds_np, actual_prompt_len=valid_len)
+        else:
+            self.pipeline.set_language_embeds_torch(embeds, actual_prompt_len=valid_len)
+        if hasattr(self.pipeline, "set_openpi_stage_fusion_mask"):
+            self.pipeline.set_openpi_stage_fusion_mask(
+                self._dvt2_prompt_len,
+                int(self.fixed_state_prompt_len or self._dvt2_prompt_len),
+                self.dvt2_profile.stage_fusion_num_tokens,
+            )
+        self._dvt2_uploaded_stage = int(self._dvt2_current_stage)
+        self._dvt2_uploaded_task_category = int(self._dvt2_task_category)
+
+    def _finish_dvt2_heads(self, prefix_out: Optional[torch.Tensor]) -> dict[str, np.ndarray]:
+        if (
+            not self._dvt2_enabled
+            or self._dvt2_weights is None
+            or prefix_out is None
+            or self.pipeline is None
+        ):
+            return {}
+        profile = self.dvt2_profile
+        prompt_len = int(self._dvt2_prompt_len)
+        if prompt_len <= 0:
+            return {}
+        with torch.no_grad():
+            condition_stage = int(self._dvt2_current_stage)
+            prefix = prefix_out.float()
+            vision_tokens = int(self.pipeline.vision_seq_enc)
+            per_camera = max(1, vision_tokens // max(1, self.num_views))
+            base_out = prefix[:per_camera]
+            prompt_out = prefix[vision_tokens : vision_tokens + prompt_len]
+            base_pooled = base_out.mean(dim=0)
+            prompt_pooled = prompt_out.mean(dim=0)
+            logits = stage_logits_torch(
+                prompt_pooled,
+                self._dvt2_task_category,
+                self._dvt2_weights,
+                profile,
+            )
+            pred_stage = int(torch.argmax(logits).item())
+            exist_pred, exist_prob = exist_prediction_torch(
+                base_pooled,
+                prompt_pooled,
+                self._dvt2_weights,
+            )
+            exist_i = int(exist_pred.item())
+            output_stage = -1 if exist_i == 0 else pred_stage
+            normalized = normalize_stage(output_stage, self._dvt2_task_category, profile)
+            self._dvt2_current_stage = int(
+                np.clip(
+                    pred_stage,
+                    0,
+                    num_stages_for_category(self._dvt2_task_category, profile) - 1,
+                )
+            )
+            self._dvt2_uploaded_stage = None
+        result = {
+            "subtask_logits": logits.float().cpu().numpy().astype(np.float32),
+            "predicted_stage": np.asarray(output_stage, dtype=np.int32),
+            "stage": np.asarray(normalized, dtype=np.float32 if output_stage != -1 else np.int32),
+            "exist": np.asarray(exist_i, dtype=np.int32),
+            "exist_prob": exist_prob.float().cpu().numpy().astype(np.float32),
+        }
+        debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
+        debug.update(
+            {
+                "condition_stage": int(self._dvt2_current_stage),
+                "action_condition_stage": int(condition_stage),
+                "pred_stage_raw": int(pred_stage),
+                "output_stage": int(output_stage),
+                "vision_tokens": int(getattr(self.pipeline, "vision_seq_enc", 0)),
+                "encoder_seq_len": int(getattr(self.pipeline, "encoder_seq_len", 0)),
+                "materialize_encoder_output": bool(
+                    getattr(self.pipeline, "materialize_encoder_output", False)
+                ),
+                "openpi_fixed_hole_rope": True,
+            }
+        )
+        result["dvt2_debug"] = debug
+        self._dvt2_last_debug = debug
+        self._dvt2_last_result = result
+        return result
 
     # -----------------------------------------------------------------
     # Checkpoint helpers
@@ -961,6 +1194,7 @@ class Pi05TorchFrontendRtx:
             "encoder_ffn_gate_w": p_list("encoder_ffn_gate_w"),
             "encoder_ffn_up_w": p_list("encoder_ffn_up_w"),
             "encoder_ffn_down_w": p_list("encoder_ffn_down_w"),
+            "encoder_final_norm_w": p("encoder_final_norm_w"),
 
             # Decoder
             "decoder_action_in_proj_w": p("decoder_action_in_proj_w"),
@@ -1064,9 +1298,10 @@ class Pi05TorchFrontendRtx:
 
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
+        prompt_state = self._normalize_state_for_prompt(state)
         t_embed0 = time.perf_counter()
         embeds, prompt_len = _embed_prompt(
-            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+            prompt_text, self.embedding_weight, max_len=max_len, state=prompt_state)
         self.prompt_embed_time_ms += (time.perf_counter() - t_embed0) * 1000
         runtime_prompt_len = prompt_len
         if state is not None and self.fixed_state_prompt_len is not None:
@@ -1075,6 +1310,22 @@ class Pi05TorchFrontendRtx:
                     f"tokenized state prompt length {prompt_len} exceeds "
                     f"fixed_state_prompt_len={self.fixed_state_prompt_len}")
             runtime_prompt_len = self.fixed_state_prompt_len
+        if self._dvt2_enabled:
+            self._dvt2_task_category = task_category_from_prompt(prompt_text, self.dvt2_profile)
+            self._dvt2_reset_tracker_if_needed(self._dvt2_task_category)
+            base_fixed_len = self.fixed_state_prompt_len or runtime_prompt_len
+            runtime_prompt_len = int(base_fixed_len) + int(self.dvt2_profile.stage_fusion_num_tokens)
+            self._dvt2_last_debug = {
+                "prompt_len": int(prompt_len),
+                "runtime_prompt_len": int(runtime_prompt_len),
+                "fixed_state_prompt_len": (
+                    None if self.fixed_state_prompt_len is None
+                    else int(self.fixed_state_prompt_len)
+                ),
+                "state_prompt": bool(state is not None),
+                "prompt_state_dim": 0 if prompt_state is None else int(np.asarray(prompt_state).size),
+                "task_category": int(self._dvt2_task_category),
+            }
         required_capacity = runtime_prompt_len
         self._ensure_prompt_capacity(required_capacity)
 
@@ -1114,6 +1365,7 @@ class Pi05TorchFrontendRtx:
                     num_steps=self._num_steps,
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
+                    materialize_encoder_output=self._dvt2_enabled,
                     openpi_masked_prefix=self.openpi_masked_prefix,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[runtime_prompt_len] = self.pipeline
@@ -1127,11 +1379,20 @@ class Pi05TorchFrontendRtx:
         # Upload language embeds into pipeline's encoder_x slot
         t_upload0 = time.perf_counter()
         embeds = embeds.contiguous()
-        if runtime_prompt_len != prompt_len:
+        if self._dvt2_enabled:
+            self._dvt2_base_prompt_embeds = embeds.detach().clone()
+            self._dvt2_prompt_len = int(prompt_len)
+            self._dvt2_runtime_prompt_len = int(runtime_prompt_len)
+            self._dvt2_uploaded_stage = None
+            self._dvt2_uploaded_task_category = None
+            self._dvt2_upload_conditioned_prompt_if_needed()
+        elif runtime_prompt_len != prompt_len:
             padded = embeds.new_zeros((runtime_prompt_len, embeds.shape[1]))
             padded[:prompt_len].copy_(embeds)
             embeds = padded
-        if hasattr(self.pipeline, "set_language_embeds_torch"):
+        if self._dvt2_enabled:
+            pass
+        elif hasattr(self.pipeline, "set_language_embeds_torch"):
             self.pipeline.set_language_embeds_torch(
                 embeds, actual_prompt_len=prompt_len)
         else:
@@ -1587,7 +1848,7 @@ class Pi05TorchFrontendRtx:
 
     def _stage_exist_prefix_out(self, stream_int: int) -> Optional[torch.Tensor]:
         """Copy encoder prefix output for the optional OpenPI exist head."""
-        if not self._has_exist_head or self.pipeline is None:
+        if (not self._has_exist_head and not self._dvt2_enabled) or self.pipeline is None:
             return None
         seq = int(self.pipeline.vision_seq_enc + self.current_prompt_len)
         if seq <= 0:
@@ -1596,9 +1857,12 @@ class Pi05TorchFrontendRtx:
                 or self._exist_encoder_out.shape != (seq, ENC_D)):
             self._exist_encoder_out = torch.empty(
                 seq, ENC_D, dtype=bf16, device="cuda")
+        src_buf = self.pipeline.bufs["encoder_x"]
+        if self._dvt2_enabled and bool(getattr(self.pipeline, "materialize_encoder_output", False)):
+            src_buf = self.pipeline.bufs["encoder_x_norm"]
         self._cudart.cudaMemcpyAsync(
             ctypes.c_void_p(self._exist_encoder_out.data_ptr()),
-            ctypes.c_void_p(self.pipeline.bufs["encoder_x"].ptr.value),
+            ctypes.c_void_p(src_buf.ptr.value),
             self._exist_encoder_out.numel() * 2,
             3,
             stream_int,
@@ -1663,6 +1927,8 @@ class Pi05TorchFrontendRtx:
             self._noise_buf.normal_()
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
+            if self._dvt2_enabled:
+                self._dvt2_upload_conditioned_prompt_if_needed()
 
             if use_full:
                 self._fill_img_buf(observation)
@@ -1686,7 +1952,8 @@ class Pi05TorchFrontendRtx:
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
 
-        exist_result = self._finish_exist_head(exist_prefix_out)
+        dvt2_result = self._finish_dvt2_heads(exist_prefix_out)
+        exist_result = dvt2_result or self._finish_exist_head(exist_prefix_out)
         raw_actions = self._noise_out.float().cpu().numpy()  # (chunk, 32)
         if "exist" in exist_result and int(np.asarray(exist_result["exist"])) == 0:
             raw_actions.fill(0.0)

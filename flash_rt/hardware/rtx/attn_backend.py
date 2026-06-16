@@ -472,6 +472,56 @@ class RtxFlashAttnBackend:
             )
             self._openpi_dec_mask.copy_(valid_kv.view(1, 1, 1, -1))
 
+    def update_openpi_prefix_stage_fusion_mask(
+        self,
+        valid_before_padding: int,
+        fusion_start: int,
+        fusion_tokens: int,
+    ) -> None:
+        """Use OpenPI's block attention for prompt tokens plus stage-fusion tokens."""
+        import torch
+
+        valid_before_padding = int(valid_before_padding)
+        fusion_start = int(fusion_start)
+        fusion_tokens = int(fusion_tokens)
+        fusion_end = fusion_start + fusion_tokens
+        if valid_before_padding <= 0 or fusion_start < valid_before_padding or fusion_tokens <= 0:
+            raise ValueError(
+                "DVT2 fusion mask expects 0 < valid_before_padding <= fusion_start "
+                f"and fusion_tokens > 0; got {valid_before_padding}, {fusion_start}, {fusion_tokens}"
+            )
+        if fusion_end > self._encoder_seq_max:
+            raise ValueError(
+                f"DVT2 fusion end must be <= {self._encoder_seq_max}, got {fusion_end}"
+            )
+        self._openpi_prefix_valid_len = fusion_end
+        with torch.no_grad():
+            fusion_region = (
+                (self._openpi_enc_idx >= fusion_start)
+                & (self._openpi_enc_idx < fusion_end)
+            )
+            valid_prefix = (self._openpi_enc_idx < valid_before_padding) | fusion_region
+            key_group = fusion_region.to(dtype=torch.int32)
+            query_group = torch.where(
+                valid_prefix,
+                key_group,
+                torch.ones_like(key_group),
+            )
+            enc_mask = (
+                valid_prefix.view(1, -1)
+                & (key_group.view(1, -1) <= query_group.view(-1, 1))
+            )
+            self._openpi_enc_mask.copy_(enc_mask.view(1, 1, self._encoder_seq_max, self._encoder_seq_max))
+            self._openpi_enc_query_scale.copy_(
+                valid_prefix.to(dtype=self._openpi_enc_query_scale.dtype).view(1, -1, 1, 1))
+            fixed_prefix = self._encoder_seq_max
+            valid_kv = (
+                (self._openpi_kv_idx < valid_before_padding)
+                | ((self._openpi_kv_idx >= fusion_start) & (self._openpi_kv_idx < fusion_end))
+                | (self._openpi_kv_idx >= fixed_prefix)
+            )
+            self._openpi_dec_mask.copy_(valid_kv.view(1, 1, 1, -1))
+
     def _sdpa_openpi(self, q, k, v, mask, o, query_scale=None) -> int:
         import torch.nn.functional as F
         qh = q.transpose(1, 2)

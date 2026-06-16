@@ -131,9 +131,6 @@ def _load_orbax(path: str) -> Dict[str, np.ndarray]:
         import orbax.checkpoint as ocp
         import jax
 
-        mesh = jax.sharding.Mesh(jax.devices(), ("x",))
-        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-
         try:
             with ocp.PyTreeCheckpointer() as ckptr:
                 metadata = ckptr.metadata(str(params_path))
@@ -150,7 +147,7 @@ def _load_orbax(path: str) -> Dict[str, np.ndarray]:
                         item=item,
                         restore_args=jax.tree.map(
                             lambda _: ocp.ArrayRestoreArgs(
-                                sharding=sharding, restore_type=np.ndarray
+                                sharding=None, restore_type=np.ndarray
                             ), item
                         ),
                     ),

@@ -98,7 +98,20 @@ def _random_h10w_obs(seed: int, prompt: str) -> dict:
 def _load_obs(path: Path) -> dict:
     data = np.load(path, allow_pickle=True)
     if "obs" in data:
-        return data["obs"].item()
+        obs = dict(data["obs"].item())
+        passthrough_keys = {
+            "episode_index",
+            "frame_index",
+            "task_index",
+            "task_category",
+            "subtask_state",
+            "exist_label",
+        }
+        for key in data.files:
+            if key == "obs" or key in obs or key not in passthrough_keys:
+                continue
+            obs[key] = data[key].item() if data[key].dtype == object and data[key].shape == () else data[key]
+        return obs
     obs = {}
     for key in data.files:
         obs[key] = data[key].item() if data[key].dtype == object and data[key].shape == () else data[key]
@@ -122,6 +135,21 @@ def _maybe_exist(out: dict):
     return arr
 
 
+def _maybe_array(out: dict, key: str, dtype=None):
+    if key not in out:
+        return None
+    return np.asarray(out[key], dtype=dtype)
+
+
+def _format_optional(name: str, value) -> str:
+    if value is None:
+        return f"{name}=None"
+    arr = np.asarray(value)
+    if arr.size == 1:
+        return f"{name}={arr.reshape(-1)[0]}"
+    return f"{name}=shape{arr.shape}"
+
+
 def _stats(name: str, arr: np.ndarray) -> str:
     finite = bool(np.isfinite(arr).all())
     return (
@@ -134,11 +162,22 @@ def _stats(name: str, arr: np.ndarray) -> str:
 def _compare(a: np.ndarray, b: np.ndarray) -> dict:
     if a.shape != b.shape:
         return {"shape_match": False}
-    diff = a - b
-    denom = float(np.linalg.norm(a.ravel()) * np.linalg.norm(b.ravel()))
-    cosine = float(np.dot(a.ravel(), b.ravel()) / denom) if denom > 0 else float("nan")
+    finite = bool(np.isfinite(a).all() and np.isfinite(b).all())
+    if not finite:
+        mask = np.isfinite(a) & np.isfinite(b)
+        if not bool(mask.any()):
+            return {"shape_match": True, "finite": False}
+        a_cmp = a[mask]
+        b_cmp = b[mask]
+    else:
+        a_cmp = a
+        b_cmp = b
+    diff = a_cmp - b_cmp
+    denom = float(np.linalg.norm(a_cmp.ravel()) * np.linalg.norm(b_cmp.ravel()))
+    cosine = float(np.dot(a_cmp.ravel(), b_cmp.ravel()) / denom) if denom > 0 else float("nan")
     return {
         "shape_match": True,
+        "finite": finite,
         "mae": float(np.mean(np.abs(diff))),
         "rmse": float(np.sqrt(np.mean(diff * diff))),
         "max_abs": float(np.max(np.abs(diff))),
@@ -194,6 +233,12 @@ def parse_args() -> argparse.Namespace:
                    help="Reuse the exact same observation for every step.")
     p.add_argument("--require-exist", type=int, choices=(0, 1), default=None,
                    help="Fail unless both services return this exist value.")
+    p.add_argument("--require-exist-match", action="store_true",
+                   help="Fail if both services return exist but values differ.")
+    p.add_argument("--require-stage-match", action="store_true",
+                   help="Fail if both services return predicted_stage but values differ.")
+    p.add_argument("--require-action-shape", default=None,
+                   help="Optional required action shape, e.g. 50,16.")
     p.add_argument("--summary-skip", type=int, default=0,
                    help="Skip the first N calls in latency summaries.")
     p.add_argument("--save", type=Path, default=None,
@@ -227,6 +272,14 @@ def main() -> int:
     last_obs = base_obs
     openpi_exist = []
     flashrt_exist = []
+    openpi_exist_prob = []
+    flashrt_exist_prob = []
+    openpi_predicted_stage = []
+    flashrt_predicted_stage = []
+    openpi_stage = []
+    flashrt_stage = []
+    openpi_logits = []
+    flashrt_logits = []
     openpi_times = []
     flashrt_times = []
     openpi_policy_timings = []
@@ -263,16 +316,55 @@ def main() -> int:
         flashrt_policy_timings.append(_numeric_timing(out_b))
         act_a = _actions(out_a)
         act_b = _actions(out_b)
+        if args.require_action_shape:
+            expected_shape = tuple(int(x) for x in args.require_action_shape.split(","))
+            if act_a.shape != expected_shape or act_b.shape != expected_shape:
+                raise RuntimeError(
+                    f"expected action shape {expected_shape}, got openpi={act_a.shape}, "
+                    f"flashrt={act_b.shape}"
+                )
         openpi_actions.append(act_a)
         flashrt_actions.append(act_b)
         cmp = _compare(act_a, act_b)
         exist_a = _maybe_exist(out_a)
         exist_b = _maybe_exist(out_b)
+        exist_prob_a = _maybe_array(out_a, "exist_prob", np.float32)
+        exist_prob_b = _maybe_array(out_b, "exist_prob", np.float32)
+        pred_stage_a = _maybe_array(out_a, "predicted_stage", np.int32)
+        pred_stage_b = _maybe_array(out_b, "predicted_stage", np.int32)
+        stage_a = _maybe_array(out_a, "stage")
+        stage_b = _maybe_array(out_b, "stage")
+        logits_a = _maybe_array(out_a, "subtask_logits", np.float32)
+        logits_b = _maybe_array(out_b, "subtask_logits", np.float32)
+        if exist_prob_a is not None or exist_prob_b is not None:
+            openpi_exist_prob.append(exist_prob_a)
+            flashrt_exist_prob.append(exist_prob_b)
+        if pred_stage_a is not None or pred_stage_b is not None:
+            openpi_predicted_stage.append(pred_stage_a)
+            flashrt_predicted_stage.append(pred_stage_b)
+            if args.require_stage_match and pred_stage_a is not None and pred_stage_b is not None:
+                if int(np.asarray(pred_stage_a).reshape(-1)[0]) != int(np.asarray(pred_stage_b).reshape(-1)[0]):
+                    debug_a = out_a.get("dvt2_debug")
+                    debug_b = out_b.get("dvt2_debug")
+                    raise RuntimeError(
+                        f"predicted_stage mismatch: openpi={pred_stage_a}, flashrt={pred_stage_b}; "
+                        f"openpi_debug={debug_a}, flashrt_debug={debug_b}; "
+                        f"openpi_logits={logits_a}, flashrt_logits={logits_b}"
+                    )
+        if stage_a is not None or stage_b is not None:
+            openpi_stage.append(stage_a)
+            flashrt_stage.append(stage_b)
+        if logits_a is not None or logits_b is not None:
+            openpi_logits.append(logits_a)
+            flashrt_logits.append(logits_b)
         exist_msg = ""
         if exist_a is not None or exist_b is not None:
             openpi_exist.append(exist_a)
             flashrt_exist.append(exist_b)
             exist_msg = f" exist_openpi={exist_a} exist_flashrt={exist_b}"
+            if args.require_exist_match and exist_a is not None and exist_b is not None:
+                if int(np.asarray(exist_a).reshape(-1)[0]) != int(np.asarray(exist_b).reshape(-1)[0]):
+                    raise RuntimeError(f"exist mismatch: openpi={exist_a}, flashrt={exist_b}")
             if args.require_exist is not None:
                 required = int(args.require_exist)
                 if exist_a is None or exist_b is None:
@@ -288,7 +380,21 @@ def main() -> int:
                     raise RuntimeError(
                         f"flashrt exist={exist_b}, expected {required}"
                     )
-        print(f"[{i:03d}] openpi={t_a:.2f} ms flashrt={t_b:.2f} ms compare={cmp}{exist_msg}")
+        extras = " ".join(
+            [
+                _format_optional("stage_openpi", pred_stage_a),
+                _format_optional("stage_flashrt", pred_stage_b),
+                _format_optional("exist_prob_openpi", exist_prob_a),
+                _format_optional("exist_prob_flashrt", exist_prob_b),
+            ]
+        )
+        logits_msg = ""
+        if logits_a is not None and logits_b is not None:
+            logits_msg = f" logits_compare={_compare(logits_a, logits_b)}"
+        print(
+            f"[{i:03d}] openpi={t_a:.2f} ms flashrt={t_b:.2f} ms "
+            f"compare={cmp}{exist_msg} {extras}{logits_msg}"
+        )
 
     a = np.stack(openpi_actions)
     b = np.stack(flashrt_actions)
@@ -305,6 +411,20 @@ def main() -> int:
     if openpi_exist or flashrt_exist:
         print(f"openpi exist:  {openpi_exist}")
         print(f"flashrt exist: {flashrt_exist}")
+    if openpi_predicted_stage or flashrt_predicted_stage:
+        print(f"openpi predicted_stage:  {openpi_predicted_stage}")
+        print(f"flashrt predicted_stage: {flashrt_predicted_stage}")
+    if openpi_stage or flashrt_stage:
+        print(f"openpi stage:  {openpi_stage}")
+        print(f"flashrt stage: {flashrt_stage}")
+    if openpi_exist_prob and flashrt_exist_prob and all(x is not None for x in openpi_exist_prob + flashrt_exist_prob):
+        ep_a = np.stack([np.asarray(x, dtype=np.float32) for x in openpi_exist_prob])
+        ep_b = np.stack([np.asarray(x, dtype=np.float32) for x in flashrt_exist_prob])
+        print(f"aggregate exist_prob compare: {_compare(ep_a, ep_b)}")
+    if openpi_logits and flashrt_logits and all(x is not None for x in openpi_logits + flashrt_logits):
+        l_a = np.stack([np.asarray(x, dtype=np.float32) for x in openpi_logits])
+        l_b = np.stack([np.asarray(x, dtype=np.float32) for x in flashrt_logits])
+        print(f"aggregate subtask_logits compare: {_compare(l_a, l_b)}")
 
     if args.save:
         args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +434,14 @@ def main() -> int:
             flashrt_actions=b,
             openpi_exist=np.array(openpi_exist, dtype=object),
             flashrt_exist=np.array(flashrt_exist, dtype=object),
+            openpi_exist_prob=np.array(openpi_exist_prob, dtype=object),
+            flashrt_exist_prob=np.array(flashrt_exist_prob, dtype=object),
+            openpi_predicted_stage=np.array(openpi_predicted_stage, dtype=object),
+            flashrt_predicted_stage=np.array(flashrt_predicted_stage, dtype=object),
+            openpi_stage=np.array(openpi_stage, dtype=object),
+            flashrt_stage=np.array(flashrt_stage, dtype=object),
+            openpi_logits=np.array(openpi_logits, dtype=object),
+            flashrt_logits=np.array(flashrt_logits, dtype=object),
             openpi_times_ms=np.asarray(openpi_times, dtype=np.float32),
             flashrt_times_ms=np.asarray(flashrt_times, dtype=np.float32),
             openpi_policy_timings=np.array(openpi_policy_timings, dtype=object),
