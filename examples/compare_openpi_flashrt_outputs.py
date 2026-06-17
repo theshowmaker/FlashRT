@@ -208,6 +208,10 @@ def _numeric_timing(out: dict) -> dict[str, float]:
     return result
 
 
+def _failure_message(step: int, kind: str, message: str) -> str:
+    return f"[{step:03d}] {kind}: {message}"
+
+
 def _print_timing_summary(prefix: str, rows: list[dict[str, float]]) -> None:
     keys = sorted({k for row in rows for k in row})
     for key in keys:
@@ -239,6 +243,9 @@ def parse_args() -> argparse.Namespace:
                    help="Fail if both services return predicted_stage but values differ.")
     p.add_argument("--require-action-shape", default=None,
                    help="Optional required action shape, e.g. 50,16.")
+    p.add_argument("--no-early-fail", action="store_true",
+                   help="Collect requirement failures and continue through all steps. "
+                        "The script still exits non-zero if any requirement failed.")
     p.add_argument("--summary-skip", type=int, default=0,
                    help="Skip the first N calls in latency summaries.")
     p.add_argument("--save", type=Path, default=None,
@@ -285,6 +292,14 @@ def main() -> int:
     openpi_policy_timings = []
     flashrt_policy_timings = []
     used_obs_paths = []
+    failures = []
+
+    def record_failure(step: int, kind: str, message: str) -> None:
+        formatted = _failure_message(step, kind, message)
+        if args.no_early_fail:
+            failures.append(formatted)
+            return
+        raise RuntimeError(message)
 
     for i in range(args.steps):
         if args.fixed_obs:
@@ -319,9 +334,11 @@ def main() -> int:
         if args.require_action_shape:
             expected_shape = tuple(int(x) for x in args.require_action_shape.split(","))
             if act_a.shape != expected_shape or act_b.shape != expected_shape:
-                raise RuntimeError(
+                record_failure(
+                    i,
+                    "action_shape",
                     f"expected action shape {expected_shape}, got openpi={act_a.shape}, "
-                    f"flashrt={act_b.shape}"
+                    f"flashrt={act_b.shape}",
                 )
         openpi_actions.append(act_a)
         flashrt_actions.append(act_b)
@@ -346,10 +363,12 @@ def main() -> int:
                 if int(np.asarray(pred_stage_a).reshape(-1)[0]) != int(np.asarray(pred_stage_b).reshape(-1)[0]):
                     debug_a = out_a.get("dvt2_debug")
                     debug_b = out_b.get("dvt2_debug")
-                    raise RuntimeError(
+                    record_failure(
+                        i,
+                        "predicted_stage",
                         f"predicted_stage mismatch: openpi={pred_stage_a}, flashrt={pred_stage_b}; "
                         f"openpi_debug={debug_a}, flashrt_debug={debug_b}; "
-                        f"openpi_logits={logits_a}, flashrt_logits={logits_b}"
+                        f"openpi_logits={logits_a}, flashrt_logits={logits_b}",
                     )
         if stage_a is not None or stage_b is not None:
             openpi_stage.append(stage_a)
@@ -364,21 +383,31 @@ def main() -> int:
             exist_msg = f" exist_openpi={exist_a} exist_flashrt={exist_b}"
             if args.require_exist_match and exist_a is not None and exist_b is not None:
                 if int(np.asarray(exist_a).reshape(-1)[0]) != int(np.asarray(exist_b).reshape(-1)[0]):
-                    raise RuntimeError(f"exist mismatch: openpi={exist_a}, flashrt={exist_b}")
+                    record_failure(
+                        i,
+                        "exist_match",
+                        f"exist mismatch: openpi={exist_a}, flashrt={exist_b}",
+                    )
             if args.require_exist is not None:
                 required = int(args.require_exist)
                 if exist_a is None or exist_b is None:
-                    raise RuntimeError(
+                    record_failure(
+                        i,
+                        "exist",
                         f"--require-exist={required} but one service did not return exist: "
-                        f"openpi={exist_a}, flashrt={exist_b}"
+                        f"openpi={exist_a}, flashrt={exist_b}",
                     )
-                if int(np.asarray(exist_a).reshape(-1)[0]) != required:
-                    raise RuntimeError(
-                        f"openpi exist={exist_a}, expected {required}"
+                elif int(np.asarray(exist_a).reshape(-1)[0]) != required:
+                    record_failure(
+                        i,
+                        "exist",
+                        f"openpi exist={exist_a}, expected {required}",
                     )
-                if int(np.asarray(exist_b).reshape(-1)[0]) != required:
-                    raise RuntimeError(
-                        f"flashrt exist={exist_b}, expected {required}"
+                elif int(np.asarray(exist_b).reshape(-1)[0]) != required:
+                    record_failure(
+                        i,
+                        "exist",
+                        f"flashrt exist={exist_b}, expected {required}",
                     )
         extras = " ".join(
             [
@@ -425,6 +454,10 @@ def main() -> int:
         l_a = np.stack([np.asarray(x, dtype=np.float32) for x in openpi_logits])
         l_b = np.stack([np.asarray(x, dtype=np.float32) for x in flashrt_logits])
         print(f"aggregate subtask_logits compare: {_compare(l_a, l_b)}")
+    if failures:
+        print(f"requirement failures ({len(failures)}):")
+        for failure in failures:
+            print(f"  {failure}")
 
     if args.save:
         args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -453,7 +486,7 @@ def main() -> int:
 
     openpi.close()
     flashrt.close()
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
