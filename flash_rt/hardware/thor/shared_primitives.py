@@ -456,6 +456,7 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
     HD = dims['HD']
     L = dims['L']
     total_keys = dims['total_keys']
+    materialize_output = bool(dims.get('materialize_output', False))
     Q_dim = NH * HD
     K_dim = HD
     attn_scale = 1.0 / math.sqrt(float(HD))
@@ -497,7 +498,7 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             Se, Q_dim, K_dim, HD, 2560,
             kv_elem_off, HD, stream)
 
-        if not last:
+        if (not last) or materialize_output:
             # ── 5. Attention (cuBLAS) ──
             if attn is not None:
                 attn.run("encoder", l, q_seq=Se, stream=stream)
@@ -529,10 +530,18 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
                                   Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
 
-            # ── 11. Residual + RMSNorm → FP8 for next layer (noweight) ──
-            as_next = act_scales + ((l + 1) * 4 + 0) * 4
-            fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
-                                                          Se, D, as_next, stream)
+            if l < L - 1:
+                # ── 11. Residual + RMSNorm → FP8 for next layer (noweight) ──
+                as_next = act_scales + ((l + 1) * 4 + 0) * 4
+                fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
+                                                              Se, D, as_next, stream)
+            else:
+                fvk.residual_add_fp16(x, fg, Se * D, stream)
+
+    if materialize_output:
+        fvk.rms_norm_fp16(
+            x, weights['final_norm_w'], bufs['x_out'],
+            Se, D, 1e-6, stream)
 
     # x[Se, D] now contains final encoder output
 
@@ -616,6 +625,7 @@ def encoder_forward_calibrate(gemm, fvk_mod, bufs, weights, dims,
     Se = dims['Se']; D = dims['D']; H = dims['H']
     NH = dims['NH']; HD = dims['HD']; L = dims['L']
     total_keys = dims['total_keys']
+    materialize_output = bool(dims.get('materialize_output', False))
     Q_dim = NH * HD; K_dim = HD
     attn_scale = 1.0 / math.sqrt(float(HD))
 
@@ -664,7 +674,7 @@ def encoder_forward_calibrate(gemm, fvk_mod, bufs, weights, dims,
                                              Se, Q_dim, K_dim, HD, 2560,
                                              kv_off, HD, stream)
 
-        if not last:
+        if (not last) or materialize_output:
             # 5. Attention
             K_ptr = weights['Kc'] + kv_off * 2
             V_ptr = weights['Vc'] + kv_off * 2

@@ -37,3 +37,13 @@ void softmax_prefix_masked_fp16(__half* data, int rows, int cols,
                                 int enc_seq_fixed, int pad_start,
                                 bool allow_action_chunk,
                                 cudaStream_t stream = 0);
+
+void softmax_prefix_stage_fusion_masked_fp16(__half* data, int rows, int cols,
+                                             int query_len,
+                                             const int* valid_prefix_len,
+                                             int fusion_start,
+                                             int fusion_tokens,
+                                             int enc_seq_fixed,
+                                             int pad_start,
+                                             bool allow_action_chunk,
+                                             cudaStream_t stream = 0);

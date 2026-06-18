@@ -205,9 +205,40 @@ def transform_jax_weights(raw: dict) -> dict:
 
     # ── Encoder (Gemma 2B, 18 layers) ──
     out["encoder.embedding"] = raw["PaliGemma.llm.embedder.input_embedding"].astype(np.float16)
+    if "PaliGemma.llm.final_norm.scale" in raw:
+        out["encoder.final_norm.weight"] = (
+            1.0 + raw["PaliGemma.llm.final_norm.scale"]
+        ).astype(np.float16)
     if "exist_head.kernel" in raw and "exist_head.bias" in raw:
         out["exist_head.weight"] = raw["exist_head.kernel"].astype(np.float32)
         out["exist_head.bias"] = raw["exist_head.bias"].astype(np.float32)
+
+    def add_linear(prefix: str, out_prefix: str) -> None:
+        k_w = f"{prefix}.kernel"
+        k_b = f"{prefix}.bias"
+        if k_w in raw and k_b in raw:
+            out[f"{out_prefix}.weight"] = raw[k_w].astype(np.float32)
+            out[f"{out_prefix}.bias"] = raw[k_b].astype(np.float32)
+
+    def add_embed(prefix: str, out_key: str) -> None:
+        key = f"{prefix}.embedding"
+        if key in raw:
+            out[out_key] = raw[key].astype(np.float32)
+
+    # Optional DVT2/System2 policy heads.
+    add_embed("stage_task_embed", "stage_task_embed")
+    add_linear("stage_mlp_1", "stage_mlp_1")
+    add_linear("stage_mlp_2", "stage_mlp_2")
+    add_linear("exist_mlp_1", "exist_mlp_1")
+    add_linear("exist_mlp_2", "exist_mlp_2")
+    add_embed("stage_class_embeddings", "stage_class_embeddings")
+    add_embed("task_stage_embeddings", "task_stage_embeddings")
+    add_linear("gate_sincos", "gate_sincos")
+    add_linear("gate_task_stage", "gate_task_stage")
+    add_linear("gate_task", "gate_task")
+    add_linear("fusion_layer1", "fusion_layer1")
+    add_linear("fusion_layer2", "fusion_layer2")
+    add_linear("stage_projection", "stage_projection")
 
     for i in range(18):
         pfx = f"encoder.layer.{i}"

@@ -55,6 +55,17 @@ import jax.numpy as jnp
 
 
 from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN  # noqa: E402
+from flash_rt.core.utils.dvt2_policy import (  # noqa: E402
+    PROFILE_DVT2_0605,
+    DVT2Profile,
+    exist_prediction_numpy,
+    make_stage_fusion_tokens_numpy,
+    normalize_stage,
+    num_stages_for_category,
+    resolve_policy_profile,
+    stage_logits_numpy,
+    task_category_from_prompt,
+)
 from flash_rt.core.thor_frontend_utils import (  # noqa: E402
     embed_prompt_numpy as _embed_prompt,
     fast_state_tokenizer_cache_size,
@@ -88,6 +99,12 @@ class Pi05JaxFrontendThor:
         if self._requested_chunk_size <= 0:
             raise ValueError(
                 f"chunk_size must be positive, got {self._requested_chunk_size}")
+        self.policy_profile_name = str(kwargs.get("policy_profile", "auto") or "auto")
+        self.dvt2_profile: DVT2Profile | None = resolve_policy_profile(
+            self.policy_profile_name, checkpoint_dir)
+        self._dvt2_enabled = self.dvt2_profile is not None
+        if self._dvt2_enabled:
+            logger.info("Enabled Pi0.5 DVT2 policy profile on Thor (%s)", PROFILE_DVT2_0605)
         self.prompt_mode = str(kwargs.get("prompt_mode", "bucketed") or "bucketed")
         valid_prompt_modes = {"bucketed", "fixed", "openpi_masked_fixed200"}
         if self.prompt_mode not in valid_prompt_modes:
@@ -103,6 +120,8 @@ class Pi05JaxFrontendThor:
         if self.fixed_state_prompt_len is not None and self.fixed_state_prompt_len <= 0:
             raise ValueError(
                 f"fixed_state_prompt_len must be positive, got {self.fixed_state_prompt_len}")
+        if self._dvt2_enabled and self.fixed_state_prompt_len is None:
+            self.fixed_state_prompt_len = PI05_STATE_PROMPT_MAX_LEN
         self._requested_openpi_masked_prefix = (
             self.prompt_mode == "openpi_masked_fixed200")
         # Populated after flash_rt_kernels is imported; kept explicit in
@@ -134,10 +153,21 @@ class Pi05JaxFrontendThor:
         self._gemm = _fvk.GemmRunner()
         self.prompt_mask_supported = bool(
             hasattr(_fvk, "attention_qkv_fp16_prefix_masked"))
+        self.stage_fusion_mask_supported = bool(
+            hasattr(_fvk, "attention_qkv_fp16_prefix_stage_fusion_masked"))
         self.openpi_masked_prefix = (
             self._requested_openpi_masked_prefix
             and self.prompt_mask_supported
         )
+        if (
+            self._dvt2_enabled
+            and self._requested_openpi_masked_prefix
+            and not self.stage_fusion_mask_supported
+        ):
+            raise RuntimeError(
+                "Thor DVT2 openpi_masked_fixed200 requires a rebuilt "
+                "flash_rt_kernels extension with "
+                "attention_qkv_fp16_prefix_stage_fusion_masked().")
         if self._requested_openpi_masked_prefix and not self.prompt_mask_supported:
             logger.warning(
                 "prompt_mode=openpi_masked_fixed200 requested on Thor, but "
@@ -171,6 +201,8 @@ class Pi05JaxFrontendThor:
             if cached is not None:
                 cached_sa = self._cache_chunk_size(cached)
                 cached_has_exist = self._cache_has_exist_marker(cached)
+                cached_has_dvt2 = self._cache_has_dvt2_marker(cached)
+                cached_has_final_norm = self._cache_has_entry(cached, "encoder_final_norm_w")
                 if cached_sa is not None and cached_sa != self._requested_chunk_size:
                     logger.info(
                         "Ignoring weight cache with Sa=%s; requested chunk_size=%s",
@@ -178,6 +210,12 @@ class Pi05JaxFrontendThor:
                 elif cached_has_exist is None:
                     logger.info(
                         "Ignoring legacy weight cache without exist_head metadata")
+                elif not cached_has_final_norm:
+                    logger.info(
+                        "Ignoring legacy weight cache without encoder final norm")
+                elif self._dvt2_enabled and not cached_has_dvt2:
+                    logger.info(
+                        "Ignoring weight cache without DVT2 policy-head metadata")
                 else:
                     self._load_from_cache(cached)
                     cache_hit = True
@@ -208,6 +246,14 @@ class Pi05JaxFrontendThor:
         self.enc_seq_fixed = 0
         self._valid_prefix_len_buf = self._CudaBuffer.from_numpy(
             np.array([0], dtype=np.int32))
+        self._dvt2_base_prompt_embeds_np = None
+        self._dvt2_prompt_len = 0
+        self._dvt2_runtime_prompt_len = 0
+        self._dvt2_task_category = 0
+        self._dvt2_tracker_task_category = None
+        self._dvt2_current_stage = 0
+        self._dvt2_last_result = {}
+        self._dvt2_last_debug = {}
         self.prompt_set_count = 0
         self.prompt_fast_update_count = 0
         self.pipeline_build_count = 0
@@ -412,6 +458,7 @@ class Pi05JaxFrontendThor:
         ]
         self.enc_act_amax = CB.device_zeros(1, np.float32)
         self.enc_norm_buf = CB.device_empty(Se_max * max(De, He), fp16)
+        self.enc_final_out = CB.device_empty(Se_max * De, fp16)
         self.enc_x = CB.device_empty(Se_max * De, fp16)
         self.enc_rope = CB.device_empty(Se_max * 256, fp16)
 
@@ -421,6 +468,12 @@ class Pi05JaxFrontendThor:
 
         # Embedding: keep as numpy for _embed_prompt
         self._embedding_np = engine_w["encoder.embedding"].astype(fp16)
+        self.encoder_final_norm_w = CB.from_numpy(
+            engine_w.get("encoder.final_norm.weight", np.ones(De, dtype=fp16)).astype(fp16)
+        )
+        self._cache_blobs["encoder_final_norm_w"] = np.ascontiguousarray(
+            engine_w.get("encoder.final_norm.weight", np.ones(De, dtype=fp16)).astype(fp16)
+        ).tobytes()
         self._exist_head_w_np = engine_w.get(
             "exist_head.weight", np.empty((0,), dtype=np.float32)
         ).astype(np.float32)
@@ -432,6 +485,7 @@ class Pi05JaxFrontendThor:
         )
         if self._has_exist_head:
             logger.info("Loaded optional Pi0.5 exist_head")
+        self._load_dvt2_policy_weights_from_engine(engine_w)
 
         _ainw = engine_w["action.in_proj.weight"].astype(fp16)
         _ainb = engine_w["action.in_proj.bias"].astype(fp16)
@@ -491,6 +545,86 @@ class Pi05JaxFrontendThor:
         logger.info("JAX backend weights uploaded to CudaBuffer")
 
     # -----------------------------------------------------------------------
+    # DVT2 policy-head weights
+    # -----------------------------------------------------------------------
+
+    def _load_dvt2_policy_weights_from_engine(self, engine_w):
+        mapping = {
+            "_dvt2_stage_task_embed_np": "stage_task_embed",
+            "_dvt2_stage_mlp_1_w_np": "stage_mlp_1.weight",
+            "_dvt2_stage_mlp_1_b_np": "stage_mlp_1.bias",
+            "_dvt2_stage_mlp_2_w_np": "stage_mlp_2.weight",
+            "_dvt2_stage_mlp_2_b_np": "stage_mlp_2.bias",
+            "_dvt2_exist_mlp_1_w_np": "exist_mlp_1.weight",
+            "_dvt2_exist_mlp_1_b_np": "exist_mlp_1.bias",
+            "_dvt2_exist_mlp_2_w_np": "exist_mlp_2.weight",
+            "_dvt2_exist_mlp_2_b_np": "exist_mlp_2.bias",
+            "_dvt2_stage_class_embeddings_np": "stage_class_embeddings",
+            "_dvt2_task_stage_embeddings_np": "task_stage_embeddings",
+            "_dvt2_gate_sincos_w_np": "gate_sincos.weight",
+            "_dvt2_gate_sincos_b_np": "gate_sincos.bias",
+            "_dvt2_gate_task_stage_w_np": "gate_task_stage.weight",
+            "_dvt2_gate_task_stage_b_np": "gate_task_stage.bias",
+            "_dvt2_gate_task_w_np": "gate_task.weight",
+            "_dvt2_gate_task_b_np": "gate_task.bias",
+            "_dvt2_fusion_layer1_w_np": "fusion_layer1.weight",
+            "_dvt2_fusion_layer1_b_np": "fusion_layer1.bias",
+            "_dvt2_fusion_layer2_w_np": "fusion_layer2.weight",
+            "_dvt2_fusion_layer2_b_np": "fusion_layer2.bias",
+            "_dvt2_stage_projection_w_np": "stage_projection.weight",
+            "_dvt2_stage_projection_b_np": "stage_projection.bias",
+        }
+        missing = []
+        for attr, key in mapping.items():
+            if key not in engine_w:
+                missing.append(key)
+                setattr(self, attr, np.empty((0,), dtype=np.float32))
+            else:
+                setattr(self, attr, np.asarray(engine_w[key], dtype=np.float32))
+        self._dvt2_weights_np = self._collect_dvt2_weights_np()
+        if self._dvt2_enabled and self._dvt2_weights_np is None:
+            raise ValueError(
+                "DVT2 policy profile is enabled on Thor, but the Orbax checkpoint "
+                f"is missing one or more policy head weights: {missing}"
+            )
+        if self._dvt2_weights_np is not None:
+            logger.info("Loaded DVT2/System2 policy heads for Thor JAX")
+
+    def _collect_dvt2_weights_np(self):
+        required = {
+            "stage_task_embed": "_dvt2_stage_task_embed_np",
+            "stage_mlp_1_w": "_dvt2_stage_mlp_1_w_np",
+            "stage_mlp_1_b": "_dvt2_stage_mlp_1_b_np",
+            "stage_mlp_2_w": "_dvt2_stage_mlp_2_w_np",
+            "stage_mlp_2_b": "_dvt2_stage_mlp_2_b_np",
+            "exist_mlp_1_w": "_dvt2_exist_mlp_1_w_np",
+            "exist_mlp_1_b": "_dvt2_exist_mlp_1_b_np",
+            "exist_mlp_2_w": "_dvt2_exist_mlp_2_w_np",
+            "exist_mlp_2_b": "_dvt2_exist_mlp_2_b_np",
+            "stage_class_embeddings": "_dvt2_stage_class_embeddings_np",
+            "task_stage_embeddings": "_dvt2_task_stage_embeddings_np",
+            "gate_sincos_w": "_dvt2_gate_sincos_w_np",
+            "gate_sincos_b": "_dvt2_gate_sincos_b_np",
+            "gate_task_stage_w": "_dvt2_gate_task_stage_w_np",
+            "gate_task_stage_b": "_dvt2_gate_task_stage_b_np",
+            "gate_task_w": "_dvt2_gate_task_w_np",
+            "gate_task_b": "_dvt2_gate_task_b_np",
+            "fusion_layer1_w": "_dvt2_fusion_layer1_w_np",
+            "fusion_layer1_b": "_dvt2_fusion_layer1_b_np",
+            "fusion_layer2_w": "_dvt2_fusion_layer2_w_np",
+            "fusion_layer2_b": "_dvt2_fusion_layer2_b_np",
+            "stage_projection_w": "_dvt2_stage_projection_w_np",
+            "stage_projection_b": "_dvt2_stage_projection_b_np",
+        }
+        weights = {}
+        for key, attr in required.items():
+            arr = getattr(self, attr, None)
+            if arr is None or np.asarray(arr).size == 0:
+                return None
+            weights[key] = np.asarray(arr, dtype=np.float32)
+        return weights
+
+    # -----------------------------------------------------------------------
     # FP8 Weight Cache (save / load)
     # -----------------------------------------------------------------------
 
@@ -507,6 +641,7 @@ class Pi05JaxFrontendThor:
         ("final_ln_b", False, False),
         ("proj_w", False, False),
         ("mm_b", False, False),
+        ("encoder_final_norm_w", False, False),
         # Encoder (5 buffers list + w_scales)
         ("ew", True, False),
         ("enc_w_dev", False, True),
@@ -527,6 +662,21 @@ class Pi05JaxFrontendThor:
         "_embedding_np", "_time_mlp_in_w", "_time_mlp_in_b",
         "_time_mlp_out_w", "_time_mlp_out_b", "_final_mod_w", "_final_mod_b",
         "_time_emb_np", "_kc_t", "_ks_t", "_exist_head_w_np", "_exist_head_b_np",
+    ]
+    _DVT2_NUMPY = [
+        "_dvt2_stage_task_embed_np",
+        "_dvt2_stage_mlp_1_w_np", "_dvt2_stage_mlp_1_b_np",
+        "_dvt2_stage_mlp_2_w_np", "_dvt2_stage_mlp_2_b_np",
+        "_dvt2_exist_mlp_1_w_np", "_dvt2_exist_mlp_1_b_np",
+        "_dvt2_exist_mlp_2_w_np", "_dvt2_exist_mlp_2_b_np",
+        "_dvt2_stage_class_embeddings_np",
+        "_dvt2_task_stage_embeddings_np",
+        "_dvt2_gate_sincos_w_np", "_dvt2_gate_sincos_b_np",
+        "_dvt2_gate_task_stage_w_np", "_dvt2_gate_task_stage_b_np",
+        "_dvt2_gate_task_w_np", "_dvt2_gate_task_b_np",
+        "_dvt2_fusion_layer1_w_np", "_dvt2_fusion_layer1_b_np",
+        "_dvt2_fusion_layer2_w_np", "_dvt2_fusion_layer2_b_np",
+        "_dvt2_stage_projection_w_np", "_dvt2_stage_projection_b_np",
     ]
     # Per-layer numpy lists
     _CACHE_NUMPY_LISTS = [
@@ -572,6 +722,14 @@ class Pi05JaxFrontendThor:
             entries.append({"name": attr, "dtype": str(arr.dtype),
                             "shape": list(arr.shape)})
             blobs.append(np.ascontiguousarray(arr).tobytes())
+        for attr in self._DVT2_NUMPY:
+            arr = getattr(self, attr, None)
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            entries.append({"name": attr, "dtype": str(arr.dtype),
+                            "shape": list(arr.shape)})
+            blobs.append(np.ascontiguousarray(arr).tobytes())
 
         # Per-layer numpy lists
         for attr in self._CACHE_NUMPY_LISTS:
@@ -586,7 +744,8 @@ class Pi05JaxFrontendThor:
                 "De": self.De, "He": self.He, "Le": self.Le,
                 "NHe": self.NHe, "HDe": self.HDe,
                 "Sa": self.Sa, "Da": self.Da, "Ha": self.Ha, "La": self.La,
-                "has_exist_head": bool(getattr(self, "_has_exist_head", False))}
+                "has_exist_head": bool(getattr(self, "_has_exist_head", False)),
+                "has_dvt2_heads": bool(self._collect_dvt2_weights_np() is not None)}
         dims_json = json.dumps(dims).encode("utf-8")
         entries.append({"name": "_dims", "dtype": "json", "shape": [len(dims_json)]})
         blobs.append(dims_json)
@@ -657,6 +816,18 @@ class Pi05JaxFrontendThor:
         )
         if self._has_exist_head:
             logger.info("Loaded optional Pi0.5 exist_head from cache")
+        for attr in self._DVT2_NUMPY:
+            if attr in lookup:
+                setattr(self, attr, _get_numpy(attr))
+            else:
+                setattr(self, attr, np.empty((0,), dtype=np.float32))
+        self._dvt2_weights_np = self._collect_dvt2_weights_np()
+        if self._dvt2_enabled and self._dvt2_weights_np is None:
+            raise ValueError(
+                "DVT2 policy profile is enabled on Thor, but the weight cache "
+                "does not contain all DVT2 policy head weights.")
+        if self._dvt2_weights_np is not None:
+            logger.info("Loaded DVT2/System2 policy heads from cache")
 
         # Per-layer numpy lists
         for attr in self._CACHE_NUMPY_LISTS:
@@ -701,6 +872,7 @@ class Pi05JaxFrontendThor:
         ]
         self.enc_act_amax = CB.device_zeros(1, np.float32)
         self.enc_norm_buf = CB.device_empty(Se_max * max(De, He), fp16)
+        self.enc_final_out = CB.device_empty(Se_max * De, fp16)
         self.enc_x = CB.device_empty(Se_max * De, fp16)
         self.enc_rope = CB.device_empty(Se_max * 256, fp16)
 
@@ -759,6 +931,104 @@ class Pi05JaxFrontendThor:
             return None
         return bool(dims.get("has_exist_head"))
 
+    @staticmethod
+    def _cache_has_dvt2_marker(cached):
+        dims = Pi05JaxFrontendThor._cache_dims(cached)
+        if not dims or "has_dvt2_heads" not in dims:
+            return None
+        return bool(dims.get("has_dvt2_heads"))
+
+    @staticmethod
+    def _cache_has_entry(cached, name):
+        header, _ = cached
+        return any(entry.get("name") == name for entry in header.get("entries", []))
+
+    def _normalize_state_for_prompt(self, state):
+        if state is None:
+            return None
+        arr = np.asarray(state, dtype=np.float32).reshape(-1)
+        state_stats = self.norm_stats.get("state", {}) if isinstance(self.norm_stats, dict) else {}
+        q01 = state_stats.get("q01")
+        q99 = state_stats.get("q99")
+        if q01 is None or q99 is None:
+            return arr
+        q01_arr = np.asarray(q01, dtype=np.float32).reshape(-1)
+        q99_arr = np.asarray(q99, dtype=np.float32).reshape(-1)
+        n = min(arr.size, q01_arr.size, q99_arr.size)
+        out = arr.copy()
+        if n > 0:
+            out[:n] = (out[:n] - q01_arr[:n]) / (q99_arr[:n] - q01_arr[:n] + 1e-6) * 2.0 - 1.0
+        return out.astype(np.float32, copy=False)
+
+    def reset_dvt2_tracker(self):
+        if not self._dvt2_enabled:
+            return
+        self._dvt2_current_stage = 0
+        self._dvt2_last_debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
+        self._dvt2_last_debug["reset_dvt2_tracker"] = True
+
+    def _dvt2_reset_tracker_if_needed(self, task_category):
+        if self._dvt2_tracker_task_category != int(task_category):
+            self._dvt2_tracker_task_category = int(task_category)
+            self._dvt2_current_stage = 0
+
+    def _dvt2_condition_prompt_embeds(self, base_embeds_np, prompt_len, runtime_prompt_len):
+        if not self._dvt2_enabled or self._dvt2_weights_np is None:
+            return base_embeds_np, int(prompt_len)
+        profile = self.dvt2_profile
+        prompt_capacity = int(self.fixed_state_prompt_len or prompt_len)
+        fusion_tokens = int(profile.stage_fusion_num_tokens)
+        fusion_start = prompt_capacity
+        if runtime_prompt_len < fusion_start + fusion_tokens:
+            raise ValueError(
+                f"DVT2 runtime prompt length {runtime_prompt_len} is smaller than "
+                f"fusion end {fusion_start + fusion_tokens}")
+        fusion = make_stage_fusion_tokens_numpy(
+            base_embeds_np[:prompt_len],
+            self._dvt2_task_category,
+            self._dvt2_current_stage,
+            self._dvt2_weights_np,
+            profile,
+        )
+        out = np.zeros((runtime_prompt_len, base_embeds_np.shape[1]), dtype=base_embeds_np.dtype)
+        out[:prompt_len] = base_embeds_np[:prompt_len]
+        out[fusion_start:fusion_start + fusion_tokens] = fusion
+        return out.astype(np.float16, copy=False), int(prompt_len) + fusion_tokens
+
+    def _refresh_dvt2_conditioned_prompt(self):
+        if not self._dvt2_enabled or self._dvt2_base_prompt_embeds_np is None:
+            return
+        embeds_np, _ = self._dvt2_condition_prompt_embeds(
+            self._dvt2_base_prompt_embeds_np,
+            int(self._dvt2_prompt_len),
+            int(self._dvt2_runtime_prompt_len),
+        )
+        self.lang_emb.upload(embeds_np.astype(np.float16))
+
+    def _encoder_rope_np(self, prompt_len, Se, fixed_state):
+        positions = np.arange(Se, dtype=np.int64)
+        if self._dvt2_enabled:
+            prompt_capacity = int(self.fixed_state_prompt_len or prompt_len)
+            prefix_before_padding = int(self.sig_dims[0]) + int(prompt_len)
+            fusion_start = int(self.sig_dims[0]) + prompt_capacity
+            fusion_tokens = int(self.dvt2_profile.stage_fusion_num_tokens)
+            fusion_end = fusion_start + fusion_tokens
+            if not (0 < prefix_before_padding <= fusion_start <= fusion_end <= Se):
+                raise ValueError(
+                    "invalid Thor DVT2 RoPE layout: "
+                    f"prefix_before_padding={prefix_before_padding}, "
+                    f"fusion_start={fusion_start}, fusion_end={fusion_end}, Se={Se}")
+            if fusion_start > prefix_before_padding:
+                positions[prefix_before_padding:fusion_start] = max(prefix_before_padding - 1, 0)
+            positions[fusion_start:fusion_end] = np.arange(
+                prefix_before_padding,
+                prefix_before_padding + fusion_tokens,
+                dtype=np.int64,
+            )
+        return np.concatenate(
+            [self._kc_t[positions, :, None], self._ks_t[positions, :, None]], 2
+        ).reshape(Se, 256)
+
     def _state_prompt_capacity(self, state):
         if state is None:
             return None
@@ -779,6 +1049,8 @@ class Pi05JaxFrontendThor:
         return np.concatenate([embeds_np, pad], axis=0)[:runtime_prompt_len].astype(np.float16)
 
     def _decoder_rope_start(self, prompt_len, Se, fixed_state):
+        if self._dvt2_enabled:
+            prompt_len = int(prompt_len) + int(self.dvt2_profile.stage_fusion_num_tokens)
         if fixed_state:
             return max(0, self.sig_dims[0] + int(prompt_len) - 1)
         return Se
@@ -822,16 +1094,26 @@ class Pi05JaxFrontendThor:
     def _update_fixed_prompt_buffers(self, embeds_np, prompt_len, runtime_prompt_len, Se):
         t0 = _time.perf_counter()
         fp16 = np.float16
-        padded = self._pad_prompt_embeds(
-            embeds_np, prompt_len, runtime_prompt_len, fixed_state=True)
+        if self._dvt2_enabled:
+            self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len].copy()
+            padded, _ = self._dvt2_condition_prompt_embeds(
+                embeds_np, prompt_len, runtime_prompt_len)
+        else:
+            padded = self._pad_prompt_embeds(
+                embeds_np, prompt_len, runtime_prompt_len, fixed_state=True)
         t_pad = _time.perf_counter()
         self.lang_emb.upload(padded.astype(fp16))
         t_lang = _time.perf_counter()
+        enc_rope_np = self._encoder_rope_np(prompt_len, Se, fixed_state=True)
+        self.enc_rope.upload(enc_rope_np.astype(fp16))
         dec_rope_np = self._decoder_rope_np(prompt_len, Se, fixed_state=True)
         self.dec_rope.upload(dec_rope_np.astype(fp16))
         t_rope = _time.perf_counter()
         self.current_prompt_len = int(runtime_prompt_len)
         self.current_actual_prompt_len = int(prompt_len)
+        self._dvt2_prompt_len = int(prompt_len) if self._dvt2_enabled else 0
+        self._dvt2_runtime_prompt_len = int(runtime_prompt_len) if self._dvt2_enabled else 0
+        self._update_valid_prefix_len(prompt_len, enc_seq_fixed=Se)
         self.prompt_fast_update_count += 1
         self.language_embed_upload_count += 1
         self.last_prompt_timing.update({
@@ -848,6 +1130,8 @@ class Pi05JaxFrontendThor:
             "prompt_capacity": self.fixed_state_prompt_len,
             "openpi_masked_prefix": bool(self.openpi_masked_prefix),
             "prompt_mask_supported": bool(self.prompt_mask_supported),
+            "policy_profile": self.policy_profile_name,
+            "dvt2_profile": bool(self._dvt2_enabled),
             "fast_state_tokenizer": bool(fast_state_tokenizer_enabled()),
             "fast_state_tokenizer_cache_size": int(fast_state_tokenizer_cache_size()),
             "current_prompt_len": int(getattr(self, "current_prompt_len", 0)),
@@ -891,6 +1175,8 @@ class Pi05JaxFrontendThor:
 
         S = self.sig_dims[0]  # num_views * 256
         prompt_capacity = self._state_prompt_capacity(state)
+        if self._dvt2_enabled:
+            prompt_capacity = int(self.fixed_state_prompt_len or PI05_STATE_PROMPT_MAX_LEN)
         fixed_state = prompt_capacity is not None
         if isinstance(prompt_text, (np.ndarray, list)):
             if state is not None:
@@ -902,14 +1188,20 @@ class Pi05JaxFrontendThor:
             embeds_np = (embeds_np * float(embeds_np.shape[-1] ** 0.5)).astype(np.float16)
         else:
             max_len = prompt_capacity if prompt_capacity is not None else 48
+            prompt_state = self._normalize_state_for_prompt(state)
             embed_t0 = _time.perf_counter()
             embeds_np, prompt_len = _embed_prompt(
-                prompt_text, self._embedding_np, max_len=max_len, state=state)
+                prompt_text, self._embedding_np, max_len=max_len, state=prompt_state)
             embed_t1 = _time.perf_counter()
             self.last_prompt_timing = {
                 "thor_prompt_embed_ms": (embed_t1 - embed_t0) * 1000,
             }
+        if self._dvt2_enabled:
+            self._dvt2_task_category = task_category_from_prompt(prompt_text, self.dvt2_profile)
+            self._dvt2_reset_tracker_if_needed(self._dvt2_task_category)
         runtime_prompt_len = int(prompt_capacity or prompt_len)
+        if self._dvt2_enabled:
+            runtime_prompt_len += int(self.dvt2_profile.stage_fusion_num_tokens)
         Se = S + runtime_prompt_len
         if Se % 2 != 0:
             Se += 1
@@ -938,6 +1230,8 @@ class Pi05JaxFrontendThor:
         attn_scale = 1.0 / math.sqrt(float(self.HDe))
         layer_stride = int(self.total_keys) * int(self.HDe) * 2  # fp16 bytes
         _sig_D = int(self.sig_dims[1])  # sig_dims = (S, D, H, NH, HD, L)
+        fusion_tokens = int(self.dvt2_profile.stage_fusion_num_tokens) if self._dvt2_enabled else 0
+        fusion_start = int(S + int(self.fixed_state_prompt_len or prompt_len)) if self._dvt2_enabled else 0
         self._attn = ThorFlashAttnBackend(
             make_pi05_attention_spec(
                 num_views=self.num_views,
@@ -960,6 +1254,8 @@ class Pi05JaxFrontendThor:
                 "prefix_masked": bool(self.openpi_masked_prefix),
                 "valid_prefix_len": self._valid_prefix_len_buf.ptr.value,
                 "enc_seq_fixed": Se,
+                "fusion_start": fusion_start,
+                "fusion_tokens": fusion_tokens,
             },
             decoder_slots={
                 "Q_O":          self.ae_buf[5].ptr.value,
@@ -971,12 +1267,28 @@ class Pi05JaxFrontendThor:
                 "prefix_masked": bool(self.openpi_masked_prefix),
                 "valid_prefix_len": self._valid_prefix_len_buf.ptr.value,
                 "enc_seq_fixed": Se,
+                "fusion_start": fusion_start,
+                "fusion_tokens": fusion_tokens,
             },
         )
 
         actual_lang = Se - S
-        embeds_np = self._pad_prompt_embeds(
-            embeds_np, prompt_len, actual_lang, fixed_state=fixed_state)
+        if self._dvt2_enabled:
+            self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len].copy()
+            embeds_np, _ = self._dvt2_condition_prompt_embeds(
+                embeds_np, prompt_len, actual_lang)
+            self._dvt2_prompt_len = int(prompt_len)
+            self._dvt2_runtime_prompt_len = int(actual_lang)
+            self._dvt2_last_debug = {
+                "prompt_len": int(prompt_len),
+                "runtime_prompt_len": int(actual_lang),
+                "fixed_state_prompt_len": int(self.fixed_state_prompt_len or 0),
+                "state_prompt": bool(state is not None),
+                "task_category": int(self._dvt2_task_category),
+            }
+        else:
+            embeds_np = self._pad_prompt_embeds(
+                embeds_np, prompt_len, actual_lang, fixed_state=fixed_state)
         self.lang_emb = CB.from_numpy(embeds_np.astype(fp16))
         self.S_lang = actual_lang
         self.current_prompt_len = int(actual_lang)
@@ -984,8 +1296,7 @@ class Pi05JaxFrontendThor:
         self.language_embed_upload_count += 1
 
         # RoPE (numpy → CudaBuffer)
-        enc_rope_np = np.concatenate(
-            [self._kc_t[:Se, :, None], self._ks_t[:Se, :, None]], 2).reshape(Se, 256)
+        enc_rope_np = self._encoder_rope_np(prompt_len, Se, fixed_state=fixed_state)
         self.enc_rope = CB.from_numpy(enc_rope_np.astype(fp16))
         dec_rope_np = self._decoder_rope_np(prompt_len, Se, fixed_state=fixed_state)
         self.dec_rope = CB.from_numpy(dec_rope_np.astype(fp16))
@@ -1078,7 +1389,7 @@ class Pi05JaxFrontendThor:
              'attn_out': self.enc_buf[3].ptr.value, 'o_fp8': self.enc_buf[5].ptr.value,
              'gate': self.enc_buf[6].ptr.value, 'hidden': self.enc_buf[7].ptr.value,
              'hid_fp8': self.enc_buf[9].ptr.value, 'fg': self.enc_buf[10].ptr.value,
-             'ctx': self._ctx},
+             'ctx': self._ctx, 'x_out': self.enc_final_out.ptr.value},
             {'qkv_w': [self.ew[0].ptr.value + i * self.De * 2560 for i in range(self.Le)],
              'o_w': [self.ew[1].ptr.value + i * self.De * self.De for i in range(self.Le)],
              'gate_w': [self.ew[2].ptr.value + i * self.De * self.He * 2 for i in range(self.Le)],
@@ -1087,9 +1398,11 @@ class Pi05JaxFrontendThor:
              'Kc': self.Kc.ptr.value, 'Vc': self.Vc.ptr.value,
              'act_scales': self.enc_calib_scales.ptr.value,
              'alpha_host': [float(self.enc_alpha_host[i]) for i in range(self.Le * 4)],
-             'w_scales': self.enc_w_dev.ptr.value},
+             'w_scales': self.enc_w_dev.ptr.value,
+             'final_norm_w': self.encoder_final_norm_w.ptr.value},
             {'Se': Se, 'D': self.De, 'H': self.He, 'NH': self.NHe, 'HD': self.HDe,
-             'L': self.Le, 'total_keys': tk}
+             'L': self.Le, 'total_keys': tk,
+             'materialize_output': bool(self._dvt2_enabled)}
         )
 
     def _build_ae_dicts(self, stream_int=0):
@@ -1134,16 +1447,23 @@ class Pi05JaxFrontendThor:
         if cached is not None:
             enc_scales_np = np.array(cached["enc_scales"], dtype=np.float32)
             ae_scales_np = np.array(cached["ae_scales"], dtype=np.float32)
-            self.enc_calib_scales = CB.from_numpy_managed(enc_scales_np)
-            self.ae_calib_scales = CB.from_numpy_managed(ae_scales_np)
-            enc_ws_np = self.enc_w_dev.download_new((Le * 4,), np.float32)
-            self.enc_alpha_host = [
-                float(np.float32(enc_scales_np[i]) * np.float32(enc_ws_np[i]))
-                for i in range(Le * 4)]
-            logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
-                        Le * 4, La * 4)
-            self.calibrated = True
-            return
+            if self._dvt2_enabled:
+                last_post = enc_scales_np[(Le - 1) * 4 + 1:(Le - 1) * 4 + 4]
+                if last_post.size != 3 or not bool(np.all(np.isfinite(last_post) & (last_post > 0.0))):
+                    logger.info(
+                        "Ignoring calibration cache without materialized final encoder layer scales")
+                    cached = None
+            if cached is not None:
+                self.enc_calib_scales = CB.from_numpy_managed(enc_scales_np)
+                self.ae_calib_scales = CB.from_numpy_managed(ae_scales_np)
+                enc_ws_np = self.enc_w_dev.download_new((Le * 4,), np.float32)
+                self.enc_alpha_host = [
+                    float(np.float32(enc_scales_np[i]) * np.float32(enc_ws_np[i]))
+                    for i in range(Le * 4)]
+                logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
+                            Le * 4, La * 4)
+                self.calibrated = True
+                return
 
         # ── Cache miss: run dynamic calibration ──
 
@@ -1186,7 +1506,8 @@ class Pi05JaxFrontendThor:
             'w_scales': self.enc_w_dev.ptr.value,
         }
         enc_dims = {'Se': Se, 'D': De, 'H': He, 'NH': self.NHe, 'HD': self.HDe,
-                    'L': Le, 'total_keys': total_keys}
+                    'L': Le, 'total_keys': total_keys,
+                    'materialize_output': bool(self._dvt2_enabled)}
         encoder_forward_calibrate(
             self._gemm, self._fvk, enc_bufs, enc_weights, enc_dims,
             enc_scales_buf.ptr.value, stream=stream_int)
@@ -2569,7 +2890,8 @@ class Pi05JaxFrontendThor:
                 'w_scales': self.enc_w_dev.ptr.value,
             }
             enc_dims = {'Se': Se, 'D': De, 'H': He, 'NH': NHe, 'HD': HDe,
-                        'L': Le, 'total_keys': total_keys}
+                        'L': Le, 'total_keys': total_keys,
+                        'materialize_output': bool(self._dvt2_enabled)}
             self.Kc.zero_(stream); self.Vc.zero_(stream)
             encoder_forward_calibrate(
                 self._gemm, self._fvk, enc_bufs, enc_weights, enc_dims,
@@ -2674,7 +2996,8 @@ class Pi05JaxFrontendThor:
             'w_scales': self.enc_w_dev.ptr.value,
         }
         enc_dims = {'Se': Se, 'D': De, 'H': He, 'NH': self.NHe, 'HD': self.HDe,
-                    'L': Le, 'total_keys': total_keys}
+                    'L': Le, 'total_keys': total_keys,
+                    'materialize_output': bool(self._dvt2_enabled)}
 
         self.Kc.zero_(stream); self.Vc.zero_(stream)
         encoder_forward_calibrate(
@@ -2785,6 +3108,74 @@ class Pi05JaxFrontendThor:
             "exist_prob": np.asarray(prob, dtype=np.float32),
         }
 
+    def _finish_dvt2_heads(self):
+        if (
+            not self._dvt2_enabled
+            or self._dvt2_weights_np is None
+            or int(getattr(self, "_dvt2_prompt_len", 0)) <= 0
+        ):
+            return {}
+        profile = self.dvt2_profile
+        prefix_raw = self.enc_final_out.download_new((self.Se, self.De), np.float16).astype(np.float32)
+        prefix_finite = np.isfinite(prefix_raw)
+        prefix_nonfinite = int(prefix_raw.size - int(prefix_finite.sum()))
+        prefix_out = np.nan_to_num(prefix_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        vision_tokens = int(self.sig_dims[0])
+        prompt_len = int(self._dvt2_prompt_len)
+        per_camera = max(1, vision_tokens // max(1, int(self.num_views)))
+        base_out = prefix_out[:per_camera]
+        prompt_out = prefix_out[vision_tokens:vision_tokens + prompt_len]
+        base_pooled = base_out.mean(axis=0)
+        prompt_pooled = prompt_out.mean(axis=0)
+        logits = stage_logits_numpy(
+            prompt_pooled,
+            self._dvt2_task_category,
+            self._dvt2_weights_np,
+            profile,
+        )
+        pred_stage = int(np.argmax(logits))
+        exist_pred, exist_prob = exist_prediction_numpy(
+            base_pooled,
+            prompt_pooled,
+            self._dvt2_weights_np,
+        )
+        exist_i = int(np.asarray(exist_pred).item())
+        output_stage = -1 if exist_i == 0 else pred_stage
+        normalized = normalize_stage(output_stage, self._dvt2_task_category, profile)
+        condition_stage = int(self._dvt2_current_stage)
+        self._dvt2_current_stage = int(
+            np.clip(
+                pred_stage,
+                0,
+                num_stages_for_category(self._dvt2_task_category, profile) - 1,
+            )
+        )
+        result = {
+            "subtask_logits": np.asarray(logits, dtype=np.float32),
+            "predicted_stage": np.asarray(output_stage, dtype=np.int32),
+            "stage": np.asarray(normalized, dtype=np.float32 if output_stage != -1 else np.int32),
+            "exist": np.asarray(exist_i, dtype=np.int32),
+            "exist_prob": np.asarray(exist_prob, dtype=np.float32),
+        }
+        debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
+        debug.update({
+            "condition_stage": int(self._dvt2_current_stage),
+            "action_condition_stage": int(condition_stage),
+            "pred_stage_raw": int(pred_stage),
+            "output_stage": int(output_stage),
+            "vision_tokens": int(vision_tokens),
+            "encoder_seq_len": int(self.Se),
+            "materialize_encoder_output": True,
+            "openpi_fixed_hole_rope": True,
+            "prefix_nonfinite": int(prefix_nonfinite),
+            "base_pooled_finite": bool(np.isfinite(base_pooled).all()),
+            "prompt_pooled_finite": bool(np.isfinite(prompt_pooled).all()),
+        })
+        result["dvt2_debug"] = debug
+        self._dvt2_last_debug = debug
+        self._dvt2_last_result = result
+        return result
+
     def infer(self, observation, debug=False):
         """Run inference: upload image → CUDA Graph replay (patch_embed in graph)."""
         if self._rl_config is not None:
@@ -2811,6 +3202,7 @@ class Pi05JaxFrontendThor:
         # Noise
         noise_np = np.random.randn(self.Sa, 32).astype(np.float16)
         self.g_noise.upload(noise_np)
+        self._refresh_dvt2_conditioned_prompt()
 
         # CUDA Graph replay
         self.siglip_graph.replay(self._stream)
@@ -2820,10 +3212,13 @@ class Pi05JaxFrontendThor:
             self._cudart.cudaStreamSynchronize(self._stream)
             self._recalibrate_with_real_data()
             self._real_data_calibrated = True
+            self.g_noise.upload(noise_np)
+            self._refresh_dvt2_conditioned_prompt()
+            self.siglip_graph.replay(self._stream)
 
         self.enc_ae_graph.replay(self._stream)
         self._cudart.cudaStreamSynchronize(self._stream)
-        exist_result = self._finish_exist_head()
+        exist_result = self._finish_dvt2_heads() or self._finish_exist_head()
 
         # Output
         raw_actions = self.g_noise.download_new((self.Sa, 32), np.float16).astype(np.float32)

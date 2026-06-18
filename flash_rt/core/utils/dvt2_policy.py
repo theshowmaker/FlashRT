@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -175,6 +176,74 @@ def _linear_torch(x, weight, bias):
     return x @ weight.float() + bias.float()
 
 
+def _linear_numpy(x, weight, bias):
+    return np.asarray(x, dtype=np.float32) @ np.asarray(weight, dtype=np.float32) + np.asarray(
+        bias, dtype=np.float32
+    )
+
+
+def _gelu_numpy(x):
+    x = np.asarray(x, dtype=np.float32)
+    erf = np.vectorize(math.erf, otypes=[np.float32])
+    return 0.5 * x * (1.0 + erf(x / np.sqrt(2.0)))
+
+
+def _sigmoid_numpy(x):
+    x = np.asarray(x, dtype=np.float32)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def make_stage_fusion_tokens_numpy(
+    prompt_embeds,
+    task_category: int,
+    stage: int,
+    weights: Mapping[str, Any],
+    profile: DVT2Profile = DVT2_DEFAULT_PROFILE,
+) -> np.ndarray:
+    """Return the 4 OpenPI stage-fusion tokens as a numpy array."""
+    prompt_arr = np.asarray(prompt_embeds)
+    if prompt_arr.ndim != 2:
+        raise ValueError(f"prompt_embeds must be [tokens, dim], got {prompt_arr.shape}")
+    out_dtype = prompt_arr.dtype
+    task_embedding = prompt_arr.astype(np.float32).mean(axis=0, keepdims=True)
+    task_id = int(np.clip(task_category, 0, len(profile.category_num_stages) - 1))
+    class_state = int(stage) + 1 if profile.include_no_action_stage else int(stage)
+    class_state = int(np.clip(class_state, 0, profile.max_num_stages - 1))
+    counts = [int(x) + (1 if profile.include_no_action_stage else 0) for x in profile.category_num_stages]
+    offsets = np.cumsum([0] + counts[:-1])
+    safe_class = int(np.clip(class_state, 0, counts[task_id] - 1))
+    task_stage_idx = int(offsets[task_id] + safe_class)
+
+    stage_encoding = np.asarray(weights["stage_class_embeddings"], dtype=np.float32)[
+        class_state : class_state + 1
+    ]
+    task_stage_embedding = np.asarray(weights["task_stage_embeddings"], dtype=np.float32)[
+        task_stage_idx : task_stage_idx + 1
+    ]
+    all_inputs = np.concatenate([task_embedding, stage_encoding, task_stage_embedding], axis=-1)
+
+    gate_sincos = _sigmoid_numpy(_linear_numpy(all_inputs, weights["gate_sincos_w"], weights["gate_sincos_b"]))
+    gate_task_stage = _sigmoid_numpy(
+        _linear_numpy(all_inputs, weights["gate_task_stage_w"], weights["gate_task_stage_b"])
+    )
+    gate_task = _sigmoid_numpy(_linear_numpy(all_inputs, weights["gate_task_w"], weights["gate_task_b"]))
+    task_gated = task_embedding * gate_task
+    balanced = _linear_numpy(
+        np.maximum(_linear_numpy(all_inputs, weights["fusion_layer1_w"], weights["fusion_layer1_b"]), 0.0),
+        weights["fusion_layer2_w"],
+        weights["fusion_layer2_b"],
+    )
+    gated_stage = np.concatenate(
+        [stage_encoding * gate_sincos, task_stage_embedding * gate_task_stage],
+        axis=-1,
+    )
+    stage_dominant = _linear_numpy(gated_stage, weights["stage_projection_w"], weights["stage_projection_b"])
+    pure_stage = np.concatenate([stage_encoding, task_stage_embedding], axis=-1)
+    return np.stack([task_gated, balanced, stage_dominant, pure_stage], axis=1).squeeze(0).astype(
+        out_dtype, copy=False
+    )
+
+
 def make_stage_fusion_tokens_torch(
     prompt_embeds,
     task_category: int,
@@ -245,6 +314,24 @@ def stage_logits_torch(
     return masked
 
 
+def stage_logits_numpy(
+    prompt_pooled,
+    task_category: int,
+    weights: Mapping[str, Any],
+    profile: DVT2Profile = DVT2_DEFAULT_PROFILE,
+) -> np.ndarray:
+    """Compute masked DVT2 stage logits from pooled prompt prefix output."""
+    task_id = int(np.clip(task_category, 0, len(profile.category_num_stages) - 1))
+    task_emb = np.asarray(weights["stage_task_embed"], dtype=np.float32)[task_id : task_id + 1]
+    x = np.concatenate([np.asarray(prompt_pooled, dtype=np.float32).reshape(1, -1), task_emb], axis=-1)
+    hidden = _gelu_numpy(_linear_numpy(x, weights["stage_mlp_1_w"], weights["stage_mlp_1_b"]))
+    logits = _linear_numpy(hidden, weights["stage_mlp_2_w"], weights["stage_mlp_2_b"]).reshape(-1)
+    valid = num_stages_for_category(task_id, profile)
+    masked = logits.astype(np.float32, copy=True)
+    masked[valid:] = -np.inf
+    return masked
+
+
 def exist_prediction_torch(base_pooled, prompt_pooled, weights: Mapping[str, Any]) -> tuple[Any, Any]:
     """Return (exist_pred, exist_prob) from the DVT2 exist MLP."""
     import torch
@@ -256,3 +343,19 @@ def exist_prediction_torch(base_pooled, prompt_pooled, weights: Mapping[str, Any
     prob = torch.sigmoid(logit)
     pred = (prob > 0.5).to(torch.int32)
     return pred, prob
+
+
+def exist_prediction_numpy(base_pooled, prompt_pooled, weights: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Return (exist_pred, exist_prob) from the DVT2 exist MLP."""
+    x = np.concatenate(
+        [
+            np.asarray(base_pooled, dtype=np.float32).reshape(1, -1),
+            np.asarray(prompt_pooled, dtype=np.float32).reshape(1, -1),
+        ],
+        axis=-1,
+    )
+    hidden = _gelu_numpy(_linear_numpy(x, weights["exist_mlp_1_w"], weights["exist_mlp_1_b"]))
+    logit = _linear_numpy(hidden, weights["exist_mlp_2_w"], weights["exist_mlp_2_b"]).reshape(())
+    prob = np.asarray(_sigmoid_numpy(logit), dtype=np.float32)
+    pred = np.asarray(prob > 0.5, dtype=np.int32)
+    return pred.reshape(()), prob.reshape(())

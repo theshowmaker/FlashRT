@@ -289,6 +289,12 @@ class FlashRTPi05Policy:
             self.action_shape = tuple(int(v) for v in actions.shape)
         if pipe is not None and hasattr(pipe, "reset_dvt2_tracker"):
             pipe.reset_dvt2_tracker()
+        if pipe is not None and hasattr(pipe, "_real_data_calibrated"):
+            # Warmup uses synthetic images. Do not let Thor's lazy real-data
+            # recalibration treat that dummy pass as representative of the
+            # first real observation stream.
+            pipe._real_data_calibrated = False
+            logger.info("Reset Thor real-data calibration after dummy warmup")
 
     def metadata(self) -> dict:
         pipe = getattr(self.model, "_pipe", None)
@@ -297,6 +303,12 @@ class FlashRTPi05Policy:
         prompt_mode = getattr(pipe, "prompt_mode", self.args.prompt_mode)
         openpi_masked = bool(getattr(pipe, "openpi_masked_prefix", False))
         prompt_mask_supported = bool(getattr(pipe, "prompt_mask_supported", openpi_masked))
+        dvt2_enabled = bool(getattr(pipe, "_dvt2_enabled", False))
+        pipeline = getattr(pipe, "pipeline", None)
+        materialize_encoder_output = (
+            bool(getattr(pipeline, "materialize_encoder_output", False))
+            if pipeline is not None else dvt2_enabled
+        )
         fast_state_tokenizer = bool(getattr(pipe, "debug_prompt_stats", lambda: {})().get(
             "fast_state_tokenizer", os.environ.get("FLASH_RT_PI05_FAST_STATE_TOKENIZER", "1") != "0"))
         return {
@@ -304,7 +316,7 @@ class FlashRTPi05Policy:
             "framework": self.args.framework,
             "hardware": self.args.hardware,
             "policy_profile": getattr(pipe, "policy_profile_name", self.args.policy_profile),
-            "dvt2_profile": bool(getattr(pipe, "_dvt2_enabled", False)),
+            "dvt2_profile": dvt2_enabled,
             "robot_type": self._effective_robot_type(),
             "num_views": self.args.num_views,
             "checkpoint": self.args.checkpoint,
@@ -316,11 +328,8 @@ class FlashRTPi05Policy:
             "prompt_capacity": prompt_capacity,
             "openpi_masked_prefix": openpi_masked,
             "prompt_mask_supported": prompt_mask_supported,
-            "dvt2_materialize_encoder_output": bool(
-                getattr(pipe, "pipeline", None) is not None
-                and getattr(getattr(pipe, "pipeline", None), "materialize_encoder_output", False)
-            ),
-            "dvt2_openpi_fixed_hole_rope": bool(getattr(pipe, "_dvt2_enabled", False)),
+            "dvt2_materialize_encoder_output": materialize_encoder_output,
+            "dvt2_openpi_fixed_hole_rope": dvt2_enabled,
             "fast_state_tokenizer": fast_state_tokenizer,
             "load_s": self.load_s,
             "action_shape": list(self.action_shape or (self.args.chunk_size, -1)),

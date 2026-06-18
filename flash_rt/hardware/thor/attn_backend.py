@@ -249,17 +249,39 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 raise ValueError(
                     f"site {site!r} prefix_masked requested without "
                     "valid_prefix_len / enc_seq_fixed slots")
-            fvk.attention_qkv_fp16_prefix_masked(
-                self._ctx_cpp,
-                int(s["Q_O"]), K_ptr, V_ptr,
-                int(s["logits"]), int(s["Q_O"]),
-                q_seq, kv_seq,
-                site_spec.num_q_heads, site_spec.head_dim,
-                valid_prefix_len,
-                enc_seq_fixed,
-                site == "decoder",
-                float(s["scale"]), stream,
-            )
+            fusion_tokens = int(s.get("fusion_tokens", 0) or 0)
+            if fusion_tokens > 0:
+                fn = getattr(fvk, "attention_qkv_fp16_prefix_stage_fusion_masked", None)
+                if fn is None:
+                    raise RuntimeError(
+                        "DVT2 stage-fusion masking requires flash_rt_kernels "
+                        "with attention_qkv_fp16_prefix_stage_fusion_masked(). "
+                        "Rebuild the C++ extension before running Thor DVT2.")
+                fn(
+                    self._ctx_cpp,
+                    int(s["Q_O"]), K_ptr, V_ptr,
+                    int(s["logits"]), int(s["Q_O"]),
+                    q_seq, kv_seq,
+                    site_spec.num_q_heads, site_spec.head_dim,
+                    valid_prefix_len,
+                    int(s["fusion_start"]),
+                    fusion_tokens,
+                    enc_seq_fixed,
+                    site == "decoder",
+                    float(s["scale"]), stream,
+                )
+            else:
+                fvk.attention_qkv_fp16_prefix_masked(
+                    self._ctx_cpp,
+                    int(s["Q_O"]), K_ptr, V_ptr,
+                    int(s["logits"]), int(s["Q_O"]),
+                    q_seq, kv_seq,
+                    site_spec.num_q_heads, site_spec.head_dim,
+                    valid_prefix_len,
+                    enc_seq_fixed,
+                    site == "decoder",
+                    float(s["scale"]), stream,
+                )
         elif kernel == "state_masked":
             if state_nk is None:
                 raise ValueError(

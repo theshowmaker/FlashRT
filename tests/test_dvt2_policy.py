@@ -9,10 +9,13 @@ from flash_rt.core.utils.dvt2_policy import (
     DVT2Profile,
     clamp_h10w_dvt2_actions,
     exist_prediction_torch,
+    exist_prediction_numpy,
     h10w_dual_action_joint_bounds,
+    make_stage_fusion_tokens_numpy,
     make_stage_fusion_tokens_torch,
     normalize_stage,
     resolve_policy_profile,
+    stage_logits_numpy,
     stage_logits_torch,
     task_category_from_prompt,
 )
@@ -119,6 +122,32 @@ def test_stage_fusion_tokens_and_exist_mlp_shapes():
     assert prob.shape == ()
     assert int(exist.item()) in (0, 1)
     assert 0.0 <= float(prob.item()) <= 1.0
+
+
+def test_numpy_dvt2_heads_match_torch_helpers():
+    weights_t = _fake_weights()
+    weights_np = {k: v.numpy() for k, v in weights_t.items()}
+    prompt = torch.randn(7, 8, dtype=torch.bfloat16)
+    prompt_np = prompt.float().numpy().astype(np.float16)
+
+    pooled = torch.randn(8)
+    logits_t = stage_logits_torch(pooled, 1, weights_t, DVT2Profile())
+    logits_np = stage_logits_numpy(pooled.numpy(), 1, weights_np, DVT2Profile())
+    assert logits_np.shape == (6,)
+    assert np.isneginf(logits_np[5])
+    np.testing.assert_allclose(logits_np[:5], logits_t.numpy()[:5], rtol=1e-5, atol=1e-5)
+
+    tokens_t = make_stage_fusion_tokens_torch(prompt, 2, 5, weights_t, DVT2Profile())
+    tokens_np = make_stage_fusion_tokens_numpy(prompt_np, 2, 5, weights_np, DVT2Profile())
+    assert tokens_np.shape == (4, 8)
+    np.testing.assert_allclose(tokens_np.astype(np.float32), tokens_t.float().numpy(), rtol=5e-3, atol=5e-3)
+
+    base = torch.randn(8)
+    prompt_pooled = torch.randn(8)
+    exist_t, prob_t = exist_prediction_torch(base, prompt_pooled, weights_t)
+    exist_np, prob_np = exist_prediction_numpy(base.numpy(), prompt_pooled.numpy(), weights_np)
+    assert int(exist_np.item()) == int(exist_t.item())
+    np.testing.assert_allclose(prob_np, prob_t.numpy(), rtol=1e-6, atol=1e-6)
 
 
 def test_h10w_dvt2_clamp_preserves_gripper_columns():

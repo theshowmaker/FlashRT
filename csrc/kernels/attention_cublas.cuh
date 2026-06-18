@@ -69,3 +69,19 @@ void attention_qkv_fp16_prefix_masked(
     bool allow_action_chunk,
     float attn_scale,
     cudaStream_t stream = 0);
+
+void attention_qkv_fp16_prefix_stage_fusion_masked(
+    cublasHandle_t handle,
+    const __half* Q,
+    const __half* K,
+    const __half* V,
+    __half* logits,
+    __half* out,
+    int S, int S_kv, int NH, int HD,
+    const int* valid_prefix_len,
+    int fusion_start,
+    int fusion_tokens,
+    int enc_seq_fixed,
+    bool allow_action_chunk,
+    float attn_scale,
+    cudaStream_t stream = 0);
