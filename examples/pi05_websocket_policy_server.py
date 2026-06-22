@@ -352,13 +352,9 @@ class FlashRTPi05Policy:
         images = _extract_images(obs, self.args.num_views)
         state = None if self.args.ignore_state else _extract_state(obs)
         pipe = getattr(self.model, "_pipe", None)
-        frame_index = obs.get("frame_index")
-        try:
-            is_first_frame = frame_index is not None and int(np.asarray(frame_index).item()) == 0
-        except Exception:
-            is_first_frame = False
-        if is_first_frame and pipe is not None and hasattr(pipe, "reset_dvt2_tracker"):
-            pipe.reset_dvt2_tracker()
+        # Match OpenPI StageTracker semantics: frame_index/episode_index are
+        # metadata and do not reset tracker state. DVT2 tracker reset happens
+        # in the frontend only when the task category changes.
         prep_ms = (time.perf_counter() - prep_t0) * 1000
 
         infer_t0 = time.perf_counter()
