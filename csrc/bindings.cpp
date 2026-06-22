@@ -374,6 +374,18 @@ extern "C" int cutlass_fp8_wide_bf16out(void*, void*, void*, int, int, int, floa
 extern "C" int cutlass_fp8_t1_bf16out(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 #endif
 
+extern "C" int dvt2_heads_fp16_f32_launch(
+    const void*, const float*, const float*, const float*, const float*,
+    const float*, const float*, const float*, const float*, const float*,
+    float*, float*, float*, float*, float*, unsigned int*,
+    int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+extern "C" int dvt2_fusion_tokens_fp16_f32_launch(
+    void*, const float*, const float*, const float*, const float*,
+    const float*, const float*, const float*, const float*, const float*,
+    const float*, const float*, const float*, const float*, const float*,
+    float*, float*, float*, float*, float*,
+    int, int, int, int, int, int, int, int, cudaStream_t);
+
 #ifdef ENABLE_LINGBOT
 #include "kernels/lingbot_kernels.h"   // LingBot-VLA model kernel decls (lingbot_-prefixed, Thor sm_110a)
 #endif
@@ -581,6 +593,166 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     ;
 
     // ── Kernel functions ──
+    m.def("dvt2_heads_fp16_f32",
+          [](uintptr_t enc_final_fp16,
+             uintptr_t stage_task_embed,
+             uintptr_t stage_mlp_1_w,
+             uintptr_t stage_mlp_1_b,
+             uintptr_t stage_mlp_2_w,
+             uintptr_t stage_mlp_2_b,
+             uintptr_t exist_mlp_1_w,
+             uintptr_t exist_mlp_1_b,
+             uintptr_t exist_mlp_2_w,
+             uintptr_t exist_mlp_2_b,
+             uintptr_t base_pool,
+             uintptr_t prompt_pool,
+             uintptr_t stage_hidden,
+             uintptr_t exist_hidden,
+             uintptr_t result_out,
+             uintptr_t nonfinite_out,
+             int de,
+             int base_start,
+             int base_rows,
+             int prompt_start,
+             int prompt_rows,
+             int task_category,
+             int task_dim,
+             int stage_hidden_dim,
+             int stage_num_logits,
+             int valid_stage_logits,
+             int exist_hidden_dim,
+             uintptr_t stream) {
+              int err = dvt2_heads_fp16_f32_launch(
+                  to_ptr(enc_final_fp16),
+                  typed_ptr<float>(stage_task_embed),
+                  typed_ptr<float>(stage_mlp_1_w),
+                  typed_ptr<float>(stage_mlp_1_b),
+                  typed_ptr<float>(stage_mlp_2_w),
+                  typed_ptr<float>(stage_mlp_2_b),
+                  typed_ptr<float>(exist_mlp_1_w),
+                  typed_ptr<float>(exist_mlp_1_b),
+                  typed_ptr<float>(exist_mlp_2_w),
+                  typed_ptr<float>(exist_mlp_2_b),
+                  typed_ptr<float>(base_pool),
+                  typed_ptr<float>(prompt_pool),
+                  typed_ptr<float>(stage_hidden),
+                  typed_ptr<float>(exist_hidden),
+                  typed_ptr<float>(result_out),
+                  typed_ptr<unsigned int>(nonfinite_out),
+                  de,
+                  base_start,
+                  base_rows,
+                  prompt_start,
+                  prompt_rows,
+                  task_category,
+                  task_dim,
+                  stage_hidden_dim,
+                  stage_num_logits,
+                  valid_stage_logits,
+                  exist_hidden_dim,
+                  to_stream(stream));
+              if (err != 0) {
+                  throw std::runtime_error(
+                      std::string("dvt2_heads_fp16_f32 failed: ") +
+                      cudaGetErrorString(static_cast<cudaError_t>(err)));
+              }
+          }, py::arg("enc_final_fp16"),
+             py::arg("stage_task_embed"), py::arg("stage_mlp_1_w"),
+             py::arg("stage_mlp_1_b"), py::arg("stage_mlp_2_w"),
+             py::arg("stage_mlp_2_b"), py::arg("exist_mlp_1_w"),
+             py::arg("exist_mlp_1_b"), py::arg("exist_mlp_2_w"),
+             py::arg("exist_mlp_2_b"), py::arg("base_pool"),
+             py::arg("prompt_pool"), py::arg("stage_hidden"),
+             py::arg("exist_hidden"), py::arg("result_out"),
+             py::arg("nonfinite_out"), py::arg("de"),
+             py::arg("base_start"), py::arg("base_rows"),
+             py::arg("prompt_start"), py::arg("prompt_rows"),
+             py::arg("task_category"), py::arg("task_dim"),
+             py::arg("stage_hidden_dim"), py::arg("stage_num_logits"),
+             py::arg("valid_stage_logits"), py::arg("exist_hidden_dim"),
+             py::arg("stream") = 0);
+
+    m.def("dvt2_fusion_tokens_fp16_f32",
+          [](uintptr_t lang_emb_fp16,
+             uintptr_t stage_class_embeddings,
+             uintptr_t task_stage_embeddings,
+             uintptr_t gate_sincos_w,
+             uintptr_t gate_sincos_b,
+             uintptr_t gate_task_stage_w,
+             uintptr_t gate_task_stage_b,
+             uintptr_t gate_task_w,
+             uintptr_t gate_task_b,
+             uintptr_t fusion_layer1_w,
+             uintptr_t fusion_layer1_b,
+             uintptr_t fusion_layer2_w,
+             uintptr_t fusion_layer2_b,
+             uintptr_t stage_projection_w,
+             uintptr_t stage_projection_b,
+             uintptr_t task_mean,
+             uintptr_t gate_sincos,
+             uintptr_t gate_task_stage,
+             uintptr_t gate_task,
+             uintptr_t fusion_hidden,
+             int de,
+             int prompt_len,
+             int prompt_capacity,
+             int fusion_start,
+             int class_state,
+             int task_stage_idx,
+             int sub_dim,
+             int fusion_hidden_dim,
+             uintptr_t stream) {
+              int err = dvt2_fusion_tokens_fp16_f32_launch(
+                  to_ptr(lang_emb_fp16),
+                  typed_ptr<float>(stage_class_embeddings),
+                  typed_ptr<float>(task_stage_embeddings),
+                  typed_ptr<float>(gate_sincos_w),
+                  typed_ptr<float>(gate_sincos_b),
+                  typed_ptr<float>(gate_task_stage_w),
+                  typed_ptr<float>(gate_task_stage_b),
+                  typed_ptr<float>(gate_task_w),
+                  typed_ptr<float>(gate_task_b),
+                  typed_ptr<float>(fusion_layer1_w),
+                  typed_ptr<float>(fusion_layer1_b),
+                  typed_ptr<float>(fusion_layer2_w),
+                  typed_ptr<float>(fusion_layer2_b),
+                  typed_ptr<float>(stage_projection_w),
+                  typed_ptr<float>(stage_projection_b),
+                  typed_ptr<float>(task_mean),
+                  typed_ptr<float>(gate_sincos),
+                  typed_ptr<float>(gate_task_stage),
+                  typed_ptr<float>(gate_task),
+                  typed_ptr<float>(fusion_hidden),
+                  de,
+                  prompt_len,
+                  prompt_capacity,
+                  fusion_start,
+                  class_state,
+                  task_stage_idx,
+                  sub_dim,
+                  fusion_hidden_dim,
+                  to_stream(stream));
+              if (err != 0) {
+                  throw std::runtime_error(
+                      std::string("dvt2_fusion_tokens_fp16_f32 failed: ") +
+                      cudaGetErrorString(static_cast<cudaError_t>(err)));
+              }
+          }, py::arg("lang_emb_fp16"),
+             py::arg("stage_class_embeddings"), py::arg("task_stage_embeddings"),
+             py::arg("gate_sincos_w"), py::arg("gate_sincos_b"),
+             py::arg("gate_task_stage_w"), py::arg("gate_task_stage_b"),
+             py::arg("gate_task_w"), py::arg("gate_task_b"),
+             py::arg("fusion_layer1_w"), py::arg("fusion_layer1_b"),
+             py::arg("fusion_layer2_w"), py::arg("fusion_layer2_b"),
+             py::arg("stage_projection_w"), py::arg("stage_projection_b"),
+             py::arg("task_mean"), py::arg("gate_sincos"),
+             py::arg("gate_task_stage"), py::arg("gate_task"),
+             py::arg("fusion_hidden"), py::arg("de"), py::arg("prompt_len"),
+             py::arg("prompt_capacity"), py::arg("fusion_start"),
+             py::arg("class_state"), py::arg("task_stage_idx"),
+             py::arg("sub_dim"), py::arg("fusion_hidden_dim"),
+             py::arg("stream") = 0);
+
     // Norm
     m.def("rms_norm", [](uintptr_t x, uintptr_t weight, uintptr_t out,
                           int seq_len, int dim, float eps, uintptr_t stream) {

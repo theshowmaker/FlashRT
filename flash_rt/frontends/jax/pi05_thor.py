@@ -236,6 +236,7 @@ class Pi05JaxFrontendThor:
                 self._save_to_cache(str(checkpoint_dir))
 
         self._prefetch_weights()
+        self._init_dvt2_head_gpu_buffers()
 
         # ── State ──
         self._checkpoint_path = str(checkpoint_dir)
@@ -254,6 +255,7 @@ class Pi05JaxFrontendThor:
         self._dvt2_current_stage = 0
         self._dvt2_last_result = {}
         self._dvt2_last_debug = {}
+        self._dvt2_prompt_upload_key = None
         self.prompt_set_count = 0
         self.prompt_fast_update_count = 0
         self.pipeline_build_count = 0
@@ -624,6 +626,142 @@ class Pi05JaxFrontendThor:
             weights[key] = np.asarray(arr, dtype=np.float32)
         return weights
 
+    def _init_dvt2_head_gpu_buffers(self):
+        self._dvt2_head_gpu_enabled = False
+        self._dvt2_fusion_gpu_enabled = False
+        self._dvt2_head_gpu = {}
+        if (
+            not self._dvt2_enabled
+            or self._dvt2_weights_np is None
+        ):
+            return
+
+        weights = self._dvt2_weights_np
+        try:
+            stage_task = np.ascontiguousarray(weights["stage_task_embed"], dtype=np.float32)
+            stage_w1 = np.ascontiguousarray(weights["stage_mlp_1_w"], dtype=np.float32)
+            stage_b1 = np.ascontiguousarray(weights["stage_mlp_1_b"], dtype=np.float32)
+            stage_w2 = np.ascontiguousarray(weights["stage_mlp_2_w"], dtype=np.float32)
+            stage_b2 = np.ascontiguousarray(weights["stage_mlp_2_b"], dtype=np.float32)
+            exist_w1 = np.ascontiguousarray(weights["exist_mlp_1_w"], dtype=np.float32)
+            exist_b1 = np.ascontiguousarray(weights["exist_mlp_1_b"], dtype=np.float32)
+            exist_w2 = np.ascontiguousarray(weights["exist_mlp_2_w"], dtype=np.float32)
+            exist_b2 = np.ascontiguousarray(weights["exist_mlp_2_b"], dtype=np.float32)
+            stage_class = np.ascontiguousarray(weights["stage_class_embeddings"], dtype=np.float32)
+            task_stage = np.ascontiguousarray(weights["task_stage_embeddings"], dtype=np.float32)
+            gate_sincos_w = np.ascontiguousarray(weights["gate_sincos_w"], dtype=np.float32)
+            gate_sincos_b = np.ascontiguousarray(weights["gate_sincos_b"], dtype=np.float32)
+            gate_task_stage_w = np.ascontiguousarray(weights["gate_task_stage_w"], dtype=np.float32)
+            gate_task_stage_b = np.ascontiguousarray(weights["gate_task_stage_b"], dtype=np.float32)
+            gate_task_w = np.ascontiguousarray(weights["gate_task_w"], dtype=np.float32)
+            gate_task_b = np.ascontiguousarray(weights["gate_task_b"], dtype=np.float32)
+            fusion_layer1_w = np.ascontiguousarray(weights["fusion_layer1_w"], dtype=np.float32)
+            fusion_layer1_b = np.ascontiguousarray(weights["fusion_layer1_b"], dtype=np.float32)
+            fusion_layer2_w = np.ascontiguousarray(weights["fusion_layer2_w"], dtype=np.float32)
+            fusion_layer2_b = np.ascontiguousarray(weights["fusion_layer2_b"], dtype=np.float32)
+            stage_projection_w = np.ascontiguousarray(weights["stage_projection_w"], dtype=np.float32)
+            stage_projection_b = np.ascontiguousarray(weights["stage_projection_b"], dtype=np.float32)
+            task_dim = int(stage_task.shape[1])
+            stage_hidden = int(stage_w1.shape[1])
+            stage_logits = int(stage_w2.shape[1])
+            exist_hidden = int(exist_w1.shape[1])
+            sub_dim = int(stage_class.shape[1])
+            fusion_input = int(self.De + sub_dim * 2)
+            fusion_hidden = int(fusion_layer1_w.shape[1])
+            if (
+                stage_w1.shape != (self.De + task_dim, stage_hidden)
+                or stage_b1.shape != (stage_hidden,)
+                or stage_w2.shape != (stage_hidden, stage_logits)
+                or stage_b2.shape != (stage_logits,)
+                or exist_w1.shape != (self.De * 2, exist_hidden)
+                or exist_b1.shape != (exist_hidden,)
+                or exist_w2.shape not in {(exist_hidden, 1), (exist_hidden,)}
+                or exist_b2.size != 1
+            ):
+                logger.warning(
+                    "DVT2 GPU head disabled due to unexpected weight shapes: "
+                    "stage_task=%s stage_w1=%s stage_w2=%s exist_w1=%s exist_w2=%s",
+                    stage_task.shape, stage_w1.shape, stage_w2.shape,
+                    exist_w1.shape, exist_w2.shape)
+                stage_head_ok = False
+            else:
+                stage_head_ok = (
+                    os.environ.get("FLASH_RT_DVT2_GPU_HEAD", "1") != "0"
+                    and bool(hasattr(self._fvk, "dvt2_heads_fp16_f32"))
+                )
+            fusion_ok = (
+                os.environ.get("FLASH_RT_DVT2_GPU_FUSION", "1") != "0"
+                and hasattr(self._fvk, "dvt2_fusion_tokens_fp16_f32")
+                and self.De == sub_dim * 2
+                and gate_sincos_w.shape == (fusion_input, sub_dim)
+                and gate_sincos_b.shape == (sub_dim,)
+                and gate_task_stage_w.shape == (fusion_input, sub_dim)
+                and gate_task_stage_b.shape == (sub_dim,)
+                and gate_task_w.shape == (fusion_input, self.De)
+                and gate_task_b.shape == (self.De,)
+                and fusion_layer1_w.shape == (fusion_input, fusion_hidden)
+                and fusion_layer1_b.shape == (fusion_hidden,)
+                and fusion_layer2_w.shape == (fusion_hidden, self.De)
+                and fusion_layer2_b.shape == (self.De,)
+                and stage_projection_w.shape == (sub_dim * 2, self.De)
+                and stage_projection_b.shape == (self.De,)
+            )
+        except Exception as exc:
+            logger.warning("DVT2 GPU helpers disabled while preparing weights: %s", exc)
+            return
+
+        CB = self._CudaBuffer
+        self._dvt2_head_gpu = {
+            "stage_task": CB.from_numpy(stage_task),
+            "stage_w1": CB.from_numpy(stage_w1),
+            "stage_b1": CB.from_numpy(stage_b1),
+            "stage_w2": CB.from_numpy(stage_w2),
+            "stage_b2": CB.from_numpy(stage_b2),
+            "exist_w1": CB.from_numpy(exist_w1),
+            "exist_b1": CB.from_numpy(exist_b1),
+            "exist_w2": CB.from_numpy(np.ascontiguousarray(exist_w2.reshape(-1), dtype=np.float32)),
+            "exist_b2": CB.from_numpy(np.ascontiguousarray(exist_b2.reshape(-1), dtype=np.float32)),
+            "stage_class": CB.from_numpy(stage_class),
+            "task_stage": CB.from_numpy(task_stage),
+            "gate_sincos_w": CB.from_numpy(gate_sincos_w),
+            "gate_sincos_b": CB.from_numpy(gate_sincos_b),
+            "gate_task_stage_w": CB.from_numpy(gate_task_stage_w),
+            "gate_task_stage_b": CB.from_numpy(gate_task_stage_b),
+            "gate_task_w": CB.from_numpy(gate_task_w),
+            "gate_task_b": CB.from_numpy(gate_task_b),
+            "fusion_layer1_w": CB.from_numpy(fusion_layer1_w),
+            "fusion_layer1_b": CB.from_numpy(fusion_layer1_b),
+            "fusion_layer2_w": CB.from_numpy(fusion_layer2_w),
+            "fusion_layer2_b": CB.from_numpy(fusion_layer2_b),
+            "stage_projection_w": CB.from_numpy(stage_projection_w),
+            "stage_projection_b": CB.from_numpy(stage_projection_b),
+            "base_pool": CB.device_empty(self.De, np.float32),
+            "prompt_pool": CB.device_empty(self.De, np.float32),
+            "stage_hidden_buf": CB.device_empty(stage_hidden, np.float32),
+            "exist_hidden_buf": CB.device_empty(exist_hidden, np.float32),
+            "head_result": CB.device_empty(stage_logits + 3, np.float32),
+            "nonfinite": CB.device_empty(1, np.uint32),
+            "fusion_task_mean": CB.device_empty(self.De, np.float32),
+            "fusion_gate_sincos": CB.device_empty(sub_dim, np.float32),
+            "fusion_gate_task_stage": CB.device_empty(sub_dim, np.float32),
+            "fusion_gate_task": CB.device_empty(self.De, np.float32),
+            "fusion_hidden_buf": CB.device_empty(fusion_hidden, np.float32),
+            "task_dim": task_dim,
+            "stage_hidden": stage_hidden,
+            "stage_logits": stage_logits,
+            "exist_hidden": exist_hidden,
+            "sub_dim": sub_dim,
+            "fusion_hidden": fusion_hidden,
+        }
+        self._dvt2_head_gpu_enabled = bool(stage_head_ok)
+        self._dvt2_fusion_gpu_enabled = bool(fusion_ok)
+        logger.info(
+            "DVT2 GPU helpers: head=%s fusion=%s De=%d sub_dim=%d "
+            "stage_hidden=%d stage_logits=%d exist_hidden=%d fusion_hidden=%d",
+            self._dvt2_head_gpu_enabled,
+            self._dvt2_fusion_gpu_enabled,
+            self.De, sub_dim, stage_hidden, stage_logits, exist_hidden, fusion_hidden)
+
     # -----------------------------------------------------------------------
     # FP8 Weight Cache (save / load)
     # -----------------------------------------------------------------------
@@ -971,6 +1109,86 @@ class Pi05JaxFrontendThor:
         if self._dvt2_tracker_task_category != int(task_category):
             self._dvt2_tracker_task_category = int(task_category)
             self._dvt2_current_stage = 0
+            self._dvt2_prompt_upload_key = None
+
+    def _dvt2_current_prompt_upload_key(self):
+        return (
+            int(getattr(self, "prompt_set_count", 0)),
+            int(getattr(self, "_dvt2_task_category", 0)),
+            int(getattr(self, "_dvt2_current_stage", 0)),
+            int(getattr(self, "_dvt2_prompt_len", 0)),
+            int(getattr(self, "_dvt2_runtime_prompt_len", 0)),
+        )
+
+    def _dvt2_stage_indices(self, stage: int) -> tuple[int, int]:
+        profile = self.dvt2_profile
+        task_id = int(np.clip(
+            self._dvt2_task_category, 0, len(profile.category_num_stages) - 1))
+        class_state = int(stage) + 1 if profile.include_no_action_stage else int(stage)
+        class_state = int(np.clip(class_state, 0, profile.max_num_stages - 1))
+        counts = [
+            int(x) + (1 if profile.include_no_action_stage else 0)
+            for x in profile.category_num_stages
+        ]
+        offsets = np.cumsum([0] + counts[:-1])
+        safe_class = int(np.clip(class_state, 0, counts[task_id] - 1))
+        task_stage_idx = int(offsets[task_id] + safe_class)
+        return class_state, task_stage_idx
+
+    def _dvt2_write_fusion_tokens_gpu(self, prompt_len: int, runtime_prompt_len: int) -> bool:
+        if (
+            not bool(getattr(self, "_dvt2_fusion_gpu_enabled", False))
+            or getattr(self, "lang_emb", None) is None
+        ):
+            return False
+        g = self._dvt2_head_gpu
+        prompt_capacity = int(self.fixed_state_prompt_len or prompt_len)
+        fusion_start = prompt_capacity
+        fusion_tokens = int(self.dvt2_profile.stage_fusion_num_tokens)
+        if runtime_prompt_len < fusion_start + fusion_tokens:
+            return False
+        class_state, task_stage_idx = self._dvt2_stage_indices(
+            int(self._dvt2_current_stage))
+        stream = getattr(self, "_stream", None)
+        stream_int = int(stream.value or 0) if stream is not None else 0
+        launch_t0 = _time.perf_counter()
+        self._fvk.dvt2_fusion_tokens_fp16_f32(
+            self.lang_emb.ptr.value,
+            g["stage_class"].ptr.value,
+            g["task_stage"].ptr.value,
+            g["gate_sincos_w"].ptr.value,
+            g["gate_sincos_b"].ptr.value,
+            g["gate_task_stage_w"].ptr.value,
+            g["gate_task_stage_b"].ptr.value,
+            g["gate_task_w"].ptr.value,
+            g["gate_task_b"].ptr.value,
+            g["fusion_layer1_w"].ptr.value,
+            g["fusion_layer1_b"].ptr.value,
+            g["fusion_layer2_w"].ptr.value,
+            g["fusion_layer2_b"].ptr.value,
+            g["stage_projection_w"].ptr.value,
+            g["stage_projection_b"].ptr.value,
+            g["fusion_task_mean"].ptr.value,
+            g["fusion_gate_sincos"].ptr.value,
+            g["fusion_gate_task_stage"].ptr.value,
+            g["fusion_gate_task"].ptr.value,
+            g["fusion_hidden_buf"].ptr.value,
+            int(self.De),
+            int(prompt_len),
+            int(prompt_capacity),
+            int(fusion_start),
+            int(class_state),
+            int(task_stage_idx),
+            int(g["sub_dim"]),
+            int(g["fusion_hidden"]),
+            stream_int,
+        )
+        launch_t1 = _time.perf_counter()
+        self.last_timing["thor_dvt2_fusion_launch_ms"] = (
+            launch_t1 - launch_t0) * 1000
+        if stream is None:
+            self._sync()
+        return True
 
     def _dvt2_condition_prompt_embeds(self, base_embeds_np, prompt_len, runtime_prompt_len):
         if not self._dvt2_enabled or self._dvt2_weights_np is None:
@@ -998,12 +1216,22 @@ class Pi05JaxFrontendThor:
     def _refresh_dvt2_conditioned_prompt(self):
         if not self._dvt2_enabled or self._dvt2_base_prompt_embeds_np is None:
             return
+        key = self._dvt2_current_prompt_upload_key()
+        if self._dvt2_prompt_upload_key == key:
+            return
+        if self._dvt2_write_fusion_tokens_gpu(
+            int(self._dvt2_prompt_len),
+            int(self._dvt2_runtime_prompt_len),
+        ):
+            self._dvt2_prompt_upload_key = key
+            return
         embeds_np, _ = self._dvt2_condition_prompt_embeds(
             self._dvt2_base_prompt_embeds_np,
             int(self._dvt2_prompt_len),
             int(self._dvt2_runtime_prompt_len),
         )
         self.lang_emb.upload(embeds_np.astype(np.float16))
+        self._dvt2_prompt_upload_key = key
 
     def _encoder_rope_np(self, prompt_len, Se, fixed_state):
         positions = np.arange(Se, dtype=np.int64)
@@ -1095,30 +1323,47 @@ class Pi05JaxFrontendThor:
         t0 = _time.perf_counter()
         fp16 = np.float16
         if self._dvt2_enabled:
-            self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len].copy()
-            padded, _ = self._dvt2_condition_prompt_embeds(
-                embeds_np, prompt_len, runtime_prompt_len)
+            if bool(getattr(self, "_dvt2_fusion_gpu_enabled", False)):
+                self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len]
+                padded = self._pad_prompt_embeds(
+                    embeds_np, prompt_len, runtime_prompt_len, fixed_state=True)
+            else:
+                self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len].copy()
+                padded, _ = self._dvt2_condition_prompt_embeds(
+                    embeds_np, prompt_len, runtime_prompt_len)
         else:
             padded = self._pad_prompt_embeds(
                 embeds_np, prompt_len, runtime_prompt_len, fixed_state=True)
         t_pad = _time.perf_counter()
         self.lang_emb.upload(padded.astype(fp16))
+        t_upload = _time.perf_counter()
+        if self._dvt2_enabled and bool(getattr(self, "_dvt2_fusion_gpu_enabled", False)):
+            self._dvt2_write_fusion_tokens_gpu(prompt_len, runtime_prompt_len)
         t_lang = _time.perf_counter()
-        enc_rope_np = self._encoder_rope_np(prompt_len, Se, fixed_state=True)
-        self.enc_rope.upload(enc_rope_np.astype(fp16))
-        dec_rope_np = self._decoder_rope_np(prompt_len, Se, fixed_state=True)
-        self.dec_rope.upload(dec_rope_np.astype(fp16))
+        rope_needs_update = (
+            int(getattr(self, "current_actual_prompt_len", -1)) != int(prompt_len)
+            or int(getattr(self, "enc_seq_fixed", -1)) != int(Se)
+        )
+        if rope_needs_update:
+            enc_rope_np = self._encoder_rope_np(prompt_len, Se, fixed_state=True)
+            self.enc_rope.upload(enc_rope_np.astype(fp16))
+            dec_rope_np = self._decoder_rope_np(prompt_len, Se, fixed_state=True)
+            self.dec_rope.upload(dec_rope_np.astype(fp16))
         t_rope = _time.perf_counter()
         self.current_prompt_len = int(runtime_prompt_len)
         self.current_actual_prompt_len = int(prompt_len)
         self._dvt2_prompt_len = int(prompt_len) if self._dvt2_enabled else 0
         self._dvt2_runtime_prompt_len = int(runtime_prompt_len) if self._dvt2_enabled else 0
-        self._update_valid_prefix_len(prompt_len, enc_seq_fixed=Se)
+        if self._dvt2_enabled:
+            self._dvt2_prompt_upload_key = self._dvt2_current_prompt_upload_key()
+        if rope_needs_update:
+            self._update_valid_prefix_len(prompt_len, enc_seq_fixed=Se)
         self.prompt_fast_update_count += 1
         self.language_embed_upload_count += 1
         self.last_prompt_timing.update({
             "thor_prompt_pad_ms": (t_pad - t0) * 1000,
-            "thor_prompt_lang_upload_ms": (t_lang - t_pad) * 1000,
+            "thor_prompt_lang_upload_ms": (t_upload - t_pad) * 1000,
+            "thor_prompt_fusion_launch_ms": (t_lang - t_upload) * 1000,
             "thor_prompt_rope_upload_ms": (t_rope - t_lang) * 1000,
             "thor_prompt_buffer_update_ms": (t_rope - t0) * 1000,
         })
@@ -1193,8 +1438,10 @@ class Pi05JaxFrontendThor:
             embeds_np, prompt_len = _embed_prompt(
                 prompt_text, self._embedding_np, max_len=max_len, state=prompt_state)
             embed_t1 = _time.perf_counter()
+            embed_ms = (embed_t1 - embed_t0) * 1000
             self.last_prompt_timing = {
-                "thor_prompt_embed_ms": (embed_t1 - embed_t0) * 1000,
+                "thor_prompt_embed_ms": embed_ms,
+                "thor_state_embed_ms": embed_ms,
             }
         if self._dvt2_enabled:
             self._dvt2_task_category = task_category_from_prompt(prompt_text, self.dvt2_profile)
@@ -1214,7 +1461,7 @@ class Pi05JaxFrontendThor:
             self.last_prompt_timing["thor_prompt_total_ms"] = (
                 _time.perf_counter() - prompt_t0) * 1000
             self.current_prompt = prompt_text
-            logger.info(
+            logger.debug(
                 "Updated fixed Thor prompt buffers: actual=%d runtime=%d Se=%d",
                 prompt_len, runtime_prompt_len, Se)
             return
@@ -1274,9 +1521,14 @@ class Pi05JaxFrontendThor:
 
         actual_lang = Se - S
         if self._dvt2_enabled:
-            self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len].copy()
-            embeds_np, _ = self._dvt2_condition_prompt_embeds(
-                embeds_np, prompt_len, actual_lang)
+            if bool(getattr(self, "_dvt2_fusion_gpu_enabled", False)):
+                self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len]
+                embeds_np = self._pad_prompt_embeds(
+                    embeds_np, prompt_len, actual_lang, fixed_state=fixed_state)
+            else:
+                self._dvt2_base_prompt_embeds_np = embeds_np[:prompt_len].copy()
+                embeds_np, _ = self._dvt2_condition_prompt_embeds(
+                    embeds_np, prompt_len, actual_lang)
             self._dvt2_prompt_len = int(prompt_len)
             self._dvt2_runtime_prompt_len = int(actual_lang)
             self._dvt2_last_debug = {
@@ -1286,13 +1538,21 @@ class Pi05JaxFrontendThor:
                 "state_prompt": bool(state is not None),
                 "task_category": int(self._dvt2_task_category),
             }
+            self._dvt2_prompt_upload_key = None
         else:
             embeds_np = self._pad_prompt_embeds(
                 embeds_np, prompt_len, actual_lang, fixed_state=fixed_state)
+        lang_upload_t0 = _time.perf_counter()
         self.lang_emb = CB.from_numpy(embeds_np.astype(fp16))
+        lang_upload_t1 = _time.perf_counter()
+        if self._dvt2_enabled and bool(getattr(self, "_dvt2_fusion_gpu_enabled", False)):
+            self._dvt2_write_fusion_tokens_gpu(prompt_len, actual_lang)
+        lang_fusion_t1 = _time.perf_counter()
         self.S_lang = actual_lang
         self.current_prompt_len = int(actual_lang)
         self.current_actual_prompt_len = int(prompt_len)
+        if self._dvt2_enabled:
+            self._dvt2_prompt_upload_key = self._dvt2_current_prompt_upload_key()
         self.language_embed_upload_count += 1
 
         # RoPE (numpy → CudaBuffer)
@@ -1302,6 +1562,8 @@ class Pi05JaxFrontendThor:
         self.dec_rope = CB.from_numpy(dec_rope_np.astype(fp16))
         self.last_prompt_timing.update({
             "thor_prompt_initial_buffer_ms": (_time.perf_counter() - build_t0) * 1000,
+            "thor_prompt_lang_upload_ms": (lang_upload_t1 - lang_upload_t0) * 1000,
+            "thor_prompt_fusion_launch_ms": (lang_fusion_t1 - lang_upload_t1) * 1000,
         })
 
         # Time conditioning (JAX GPU — same matmuls as Thor but on GPU)
@@ -1644,6 +1906,15 @@ class Pi05JaxFrontendThor:
         S, D, H, NH, HD, L = self.sig_dims
 
         _cudart = ctypes.CDLL("libcudart.so")
+        _cudart.cudaMemcpy.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        _cudart.cudaMemcpy.restype = ctypes.c_int
+        _cudart.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        _cudart.cudaStreamSynchronize.restype = ctypes.c_int
         stream = ctypes.c_void_p()
         _cudart.cudaStreamCreate(ctypes.byref(stream))
         self._stream = stream
@@ -3108,6 +3379,127 @@ class Pi05JaxFrontendThor:
             "exist_prob": np.asarray(prob, dtype=np.float32),
         }
 
+    def _download_fp16_rows(self, buf, row_start: int, rows: int, cols: int) -> np.ndarray:
+        """Download a contiguous fp16 row slice from a device CudaBuffer."""
+        row_start = int(row_start)
+        rows = int(rows)
+        cols = int(cols)
+        if row_start < 0 or rows < 0 or cols <= 0:
+            raise ValueError(
+                f"invalid fp16 row slice: row_start={row_start}, rows={rows}, cols={cols}")
+        if rows == 0:
+            return np.empty((0, cols), dtype=np.float16)
+        itemsize = np.dtype(np.float16).itemsize
+        byte_offset = row_start * cols * itemsize
+        nbytes = rows * cols * itemsize
+        if byte_offset + nbytes > int(buf.nbytes):
+            raise ValueError(
+                f"fp16 row slice exceeds buffer: offset={byte_offset}, "
+                f"nbytes={nbytes}, buffer={buf.nbytes}")
+        arr = np.empty((rows, cols), dtype=np.float16)
+        ret = self._cudart.cudaMemcpy(
+            ctypes.c_void_p(arr.ctypes.data),
+            ctypes.c_void_p(int(buf.ptr.value) + byte_offset),
+            ctypes.c_size_t(nbytes),
+            2,  # cudaMemcpyDeviceToHost
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpy D2H row slice failed: {ret}")
+        return arr
+
+    def _finish_dvt2_heads_gpu(
+        self,
+        profile,
+        vision_tokens: int,
+        prompt_len: int,
+        per_camera: int,
+    ):
+        g = self._dvt2_head_gpu
+        valid_stages = num_stages_for_category(self._dvt2_task_category, profile)
+        stream_int = int(self._stream.value or 0)
+        launch_t0 = _time.perf_counter()
+        self._fvk.dvt2_heads_fp16_f32(
+            self.enc_final_out.ptr.value,
+            g["stage_task"].ptr.value,
+            g["stage_w1"].ptr.value,
+            g["stage_b1"].ptr.value,
+            g["stage_w2"].ptr.value,
+            g["stage_b2"].ptr.value,
+            g["exist_w1"].ptr.value,
+            g["exist_b1"].ptr.value,
+            g["exist_w2"].ptr.value,
+            g["exist_b2"].ptr.value,
+            g["base_pool"].ptr.value,
+            g["prompt_pool"].ptr.value,
+            g["stage_hidden_buf"].ptr.value,
+            g["exist_hidden_buf"].ptr.value,
+            g["head_result"].ptr.value,
+            g["nonfinite"].ptr.value,
+            int(self.De),
+            0,
+            int(per_camera),
+            int(vision_tokens),
+            int(prompt_len),
+            int(self._dvt2_task_category),
+            int(g["task_dim"]),
+            int(g["stage_hidden"]),
+            int(g["stage_logits"]),
+            int(valid_stages),
+            int(g["exist_hidden"]),
+            stream_int,
+        )
+        launch_t1 = _time.perf_counter()
+        download_t0 = _time.perf_counter()
+        stage_logits_n = int(g["stage_logits"])
+        head_result = g["head_result"].download_new((stage_logits_n + 3,), np.float32)
+        download_t1 = _time.perf_counter()
+
+        logits = head_result[:stage_logits_n]
+        exist_prob = np.asarray(head_result[stage_logits_n], dtype=np.float32).reshape(())
+        exist_i = int(head_result[stage_logits_n + 1] > 0.5)
+        prefix_nonfinite = int(max(0.0, head_result[stage_logits_n + 2]))
+        self.last_timing.update({
+            "thor_dvt2_head_launch_ms": (launch_t1 - launch_t0) * 1000,
+            "thor_dvt2_head_download_ms": (download_t1 - download_t0) * 1000,
+            "thor_dvt2_head_total_ms": (download_t1 - launch_t0) * 1000,
+        })
+
+        pred_stage = int(np.argmax(logits))
+        output_stage = -1 if exist_i == 0 else pred_stage
+        normalized = normalize_stage(output_stage, self._dvt2_task_category, profile)
+        condition_stage = int(self._dvt2_current_stage)
+        self._dvt2_current_stage = int(
+            np.clip(
+                pred_stage,
+                0,
+                valid_stages - 1,
+            )
+        )
+        result = {
+            "subtask_logits": np.asarray(logits, dtype=np.float32),
+            "predicted_stage": np.asarray(output_stage, dtype=np.int32),
+            "stage": np.asarray(normalized, dtype=np.float32 if output_stage != -1 else np.int32),
+            "exist": np.asarray(exist_i, dtype=np.int32),
+            "exist_prob": np.asarray(exist_prob, dtype=np.float32),
+        }
+        debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
+        debug.update({
+            "condition_stage": int(self._dvt2_current_stage),
+            "action_condition_stage": int(condition_stage),
+            "pred_stage_raw": int(pred_stage),
+            "output_stage": int(output_stage),
+            "vision_tokens": int(vision_tokens),
+            "encoder_seq_len": int(self.Se),
+            "materialize_encoder_output": True,
+            "openpi_fixed_hole_rope": True,
+            "prefix_nonfinite": int(prefix_nonfinite),
+            "dvt2_head_gpu": True,
+        })
+        result["dvt2_debug"] = debug
+        self._dvt2_last_debug = debug
+        self._dvt2_last_result = result
+        return result
+
     def _finish_dvt2_heads(self):
         if (
             not self._dvt2_enabled
@@ -3116,15 +3508,25 @@ class Pi05JaxFrontendThor:
         ):
             return {}
         profile = self.dvt2_profile
-        prefix_raw = self.enc_final_out.download_new((self.Se, self.De), np.float16).astype(np.float32)
-        prefix_finite = np.isfinite(prefix_raw)
-        prefix_nonfinite = int(prefix_raw.size - int(prefix_finite.sum()))
-        prefix_out = np.nan_to_num(prefix_raw, nan=0.0, posinf=0.0, neginf=0.0)
         vision_tokens = int(self.sig_dims[0])
         prompt_len = int(self._dvt2_prompt_len)
         per_camera = max(1, vision_tokens // max(1, int(self.num_views)))
-        base_out = prefix_out[:per_camera]
-        prompt_out = prefix_out[vision_tokens:vision_tokens + prompt_len]
+        if bool(getattr(self, "_dvt2_head_gpu_enabled", False)):
+            try:
+                return self._finish_dvt2_heads_gpu(
+                    profile, vision_tokens, prompt_len, per_camera)
+            except Exception as exc:
+                logger.warning("DVT2 GPU head failed; falling back to CPU head: %s", exc)
+                self._dvt2_head_gpu_enabled = False
+
+        base_raw = self._download_fp16_rows(
+            self.enc_final_out, 0, per_camera, self.De).astype(np.float32)
+        prompt_raw = self._download_fp16_rows(
+            self.enc_final_out, vision_tokens, prompt_len, self.De).astype(np.float32)
+        prefix_nonfinite = int(base_raw.size - int(np.isfinite(base_raw).sum()))
+        prefix_nonfinite += int(prompt_raw.size - int(np.isfinite(prompt_raw).sum()))
+        base_out = np.nan_to_num(base_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        prompt_out = np.nan_to_num(prompt_raw, nan=0.0, posinf=0.0, neginf=0.0)
         base_pooled = base_out.mean(axis=0)
         prompt_pooled = prompt_out.mean(axis=0)
         logits = stage_logits_numpy(
@@ -3181,6 +3583,7 @@ class Pi05JaxFrontendThor:
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug)
         t0 = _time.perf_counter()
+        self.last_timing = {}
 
         # Collect images
         if 'images' in observation:
@@ -3196,16 +3599,24 @@ class Pi05JaxFrontendThor:
                 return im
             return (im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
 
+        image_t0 = _time.perf_counter()
         images_np = np.stack([_normalize(im) for im in img_list[:self.num_views]])  # (nv,224,224,3)
+        image_t1 = _time.perf_counter()
         self.img_buf.upload(images_np)
+        image_t2 = _time.perf_counter()
 
         # Noise
+        noise_t0 = _time.perf_counter()
         noise_np = np.random.randn(self.Sa, 32).astype(np.float16)
         self.g_noise.upload(noise_np)
+        noise_t1 = _time.perf_counter()
         self._refresh_dvt2_conditioned_prompt()
+        prompt_refresh_t1 = _time.perf_counter()
 
         # CUDA Graph replay
+        siglip_t0 = _time.perf_counter()
         self.siglip_graph.replay(self._stream)
+        siglip_t1 = _time.perf_counter()
 
         # Lazy real-data recalibration on first call
         if not self._real_data_calibrated:
@@ -3216,23 +3627,42 @@ class Pi05JaxFrontendThor:
             self._refresh_dvt2_conditioned_prompt()
             self.siglip_graph.replay(self._stream)
 
+        enc_ae_t0 = _time.perf_counter()
         self.enc_ae_graph.replay(self._stream)
         self._cudart.cudaStreamSynchronize(self._stream)
+        enc_ae_t1 = _time.perf_counter()
         exist_result = self._finish_dvt2_heads() or self._finish_exist_head()
+        head_t1 = _time.perf_counter()
 
         # Output
+        action_download_t0 = _time.perf_counter()
         raw_actions = self.g_noise.download_new((self.Sa, 32), np.float16).astype(np.float32)
+        action_download_t1 = _time.perf_counter()
         if "exist" in exist_result and int(np.asarray(exist_result["exist"])) == 0:
             raw_actions.fill(0.0)
 
+        post_t0 = _time.perf_counter()
         if self.norm_stats:
             from flash_rt.core.utils.actions import unnormalize_actions
             unnorm = unnormalize_actions(raw_actions, self.norm_stats)
             robot_actions = unnorm[:, :self.action_dim]
         else:
             robot_actions = raw_actions
+        post_t1 = _time.perf_counter()
 
         latency = (_time.perf_counter() - t0) * 1000
+        self.last_timing.update({
+            "thor_image_norm_ms": (image_t1 - image_t0) * 1000,
+            "thor_image_upload_ms": (image_t2 - image_t1) * 1000,
+            "thor_noise_upload_ms": (noise_t1 - noise_t0) * 1000,
+            "thor_prompt_refresh_ms": (prompt_refresh_t1 - noise_t1) * 1000,
+            "thor_siglip_ms": (siglip_t1 - siglip_t0) * 1000,
+            "thor_enc_ae_ms": (enc_ae_t1 - enc_ae_t0) * 1000,
+            "thor_dvt2_head_wall_ms": (head_t1 - enc_ae_t1) * 1000,
+            "thor_action_download_ms": (action_download_t1 - action_download_t0) * 1000,
+            "thor_action_post_ms": (post_t1 - post_t0) * 1000,
+            "thor_infer_total_ms": latency,
+        })
         if debug:
             logger.info(f"JAX infer: {latency:.1f} ms")
 

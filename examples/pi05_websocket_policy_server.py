@@ -132,6 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-h10w-dual-absolute-actions", action="store_true",
                         help="Return raw normalized/unnormalized model actions without H10W dual AbsoluteActions().")
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
+    parser.add_argument("--include-dvt2-debug", action="store_true",
+                        help="Include per-frame DVT2 debug dict in websocket responses.")
     return parser.parse_args()
 
 
@@ -330,6 +332,8 @@ class FlashRTPi05Policy:
             "prompt_mask_supported": prompt_mask_supported,
             "dvt2_materialize_encoder_output": materialize_encoder_output,
             "dvt2_openpi_fixed_hole_rope": dvt2_enabled,
+            "dvt2_head_gpu": bool(getattr(pipe, "_dvt2_head_gpu_enabled", False)),
+            "dvt2_fusion_gpu": bool(getattr(pipe, "_dvt2_fusion_gpu_enabled", False)),
             "fast_state_tokenizer": fast_state_tokenizer,
             "load_s": self.load_s,
             "action_shape": list(self.action_shape or (self.args.chunk_size, -1)),
@@ -388,7 +392,7 @@ class FlashRTPi05Policy:
         for key in ("subtask_logits", "predicted_stage", "stage"):
             if key in model_result:
                 response[key] = np.asarray(model_result[key])
-        if "dvt2_debug" in model_result:
+        if self.args.include_dvt2_debug and "dvt2_debug" in model_result:
             response["dvt2_debug"] = model_result["dvt2_debug"]
         return response
 

@@ -165,6 +165,9 @@ class VLAModel:
         pipe_prompt_timing = getattr(self._pipe, "last_prompt_timing", None)
         if isinstance(pipe_prompt_timing, dict):
             self._last_timing.update(pipe_prompt_timing)
+        pipe_infer_timing = getattr(self._pipe, "last_timing", None)
+        if isinstance(pipe_infer_timing, dict):
+            self._last_timing.update(pipe_infer_timing)
         return result['actions']
 
     @property
