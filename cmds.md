@@ -334,3 +334,75 @@ import flash_rt.flash_rt_kernels as k
 print(hasattr(k, "attention_qkv_fp16_prefix_masked"))
 PY
 ```
+
+
+# Thor env setup
+
+## env
+nvcc --version
+find /usr -name nvcc 2>/dev/null
+
+(
+  风险点，不要长久写入，需要的话临时export
+)
+echo 'export PATH=/usr/local/cuda-13.0/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+(
+  删除这两行：
+sed -i '/^export PATH=\/usr\/local\/cuda-13\.0\/bin:\$PATH$/d' ~/.bashrc
+sed -i '/^export LD_LIBRARY_PATH=\/usr\/local\/cuda-13\.0\/lib64:\$LD_LIBRARY_PATH$/d' ~/.bashrc
+  检查是否删除干净？
+  grep -n 'cuda-13.0' ~/.bashrc
+)
+
+source ~/.bashrc
+nvcc --version
+
+cd FlashRT/
+python3.12 -m venv .venv
+source .venv/bin/activate
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+pip install -U pip
+pip install pybind11 cmake "numpy>=1.24" safetensors sentencepiece "transformers<4.56" pandas pillow pyarrow msgpack websockets
+pip install setuptools
+pip install -e ".[jax,server]"
+pip install -U "jax[cuda13]"
+
+(
+Codex建议改为：
+pip install -U pip setuptools wheel
+pip install pybind11 cmake ninja "numpy>=1.24" safetensors sentencepiece \
+  "transformers<4.56" pandas pillow pyarrow msgpack websockets
+pip install -U "jax[cuda13]"
+pip install -e ".[jax,server]"
+)
+
+cmake -B build -S . -DGPU_ARCH=110
+cmake --build build -j"$(nproc)"
+
+(提交"remove the need to install torch"之后，不再需要装torch)
+pip install torch==2.12.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+
+
+CUDA_VISIBLE_DEVICES=0 python examples/pi05_websocket_policy_server.py   --checkpoint ~/vla/models/0617_dvt2_all/79999   --framework jax   --hardware thor   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile pi05_dvt2_fft_0605   --robot-type dvt2   --host 0.0.0.0   --port 8001
+
+## copy files
+rsync -av --delete  --exclude .venv --exclude .git   --exclude build   --exclude '*.so'   --exclude '__pycache__'   --exclude tmp   --exclude .agents   --exclude .codex   ~/vla/FlashRT/   diana@10.8.24.139:~/vla/FlashRT/
+
+rsync -av ~/.cache/flash_rt/paligemma_tokenizer.model    diana@10.8.24.139:~/.cache/flash_rt/
+
+rsync -av --progress ./0617_dvt2_all  diana@10.8.24.139:~/vla/models/
+
+## Maybe you need
+sudo apt install libcudnn9-cuda-13 libcudnn9-dev-cuda-13
+
+如果机器人联网慢，可以在一台网络好的 Thor/同架构机器上提前做 wheel cache，然后拷贝 ~/.cache/pip 或 wheelhouse。可以缓存 wheel，不要搬 venv。
+
+(这个似乎消不掉)
+2026-06-25 13:36:07,828 [WARNING] cuBLAS < 13.2 (130000 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+
+(重新编译前，可以手动删除旧有的编译结果)
+ls -lh flash_rt/*.so build/*.so 2>/dev/null
+rm -rf build
+rm -f flash_rt/*.so

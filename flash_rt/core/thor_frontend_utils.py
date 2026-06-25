@@ -16,14 +16,10 @@ from __future__ import annotations
 import os
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 from flash_rt.core.utils.pi05_prompt import format_pi05_prompt
 
 
-# Resolved once at import time; all Thor frontends use the same FP8 dtype.
-_FP8 = torch.float8_e4m3fn
 _PALIGEMMA_TOKENIZERS = {}
 _PI05_FAST_STATE_TOKENIZERS = {}
 _SENTENCEPIECE_TOKENIZER = None
@@ -143,10 +139,12 @@ def quant_fp8(w):
     CUTLASS reads by raw data pointer assuming row-major contiguous
     storage; non-contiguous inputs would silently produce wrong outputs.
     """
+    import torch
+
     w = w.contiguous()
     a = w.float().abs().max().item()
     s = max(a / 448.0, 1e-12)
-    return (w.float() / s).clamp(-448, 448).to(_FP8), s
+    return (w.float() / s).clamp(-448, 448).to(torch.float8_e4m3fn), s
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -183,6 +181,9 @@ def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48,
     fp16 CUDA tensor, already multiplied by sqrt(hidden_dim) per Gemma
     convention.
     """
+    import torch
+    import torch.nn.functional as F
+
     try:
         tokenizer = _get_paligemma_tokenizer(max_len)
         tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
