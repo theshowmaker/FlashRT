@@ -473,6 +473,9 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
 
     act_scales = weights['act_scales']  # device float ptr (base of calib tensor)
     alpha_host = weights['alpha_host']  # host float list [L*4]
+    materialized_output_direct = False
+    materialized_post_attn_res_f32 = False
+    materialized_final_fg_f32 = False
 
     for l in range(L):
         last = (l == L - 1)
@@ -515,8 +518,23 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
                                Se, D, D, alpha_host[l * 4 + 1], 0.0, stream)
 
             # ── 7. Residual + RMSNorm → FP8 with act_scale (noweight) ──
-            fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
-                                                          Se, D, as_gu, stream)
+            if (
+                last
+                and materialize_output
+                and bufs.get('final_res_f32') is not None
+                and hasattr(fvk, 'residual_add_rms_norm_fp8_noweight_fp16_save_f32')
+            ):
+                # Preserve the true FP32 post-attention residual for DVT2
+                # final-feature materialization. The legacy FP16 residual
+                # stream is still written exactly as before, so decoder/action
+                # behavior remains on the original path.
+                fvk.residual_add_rms_norm_fp8_noweight_fp16_save_f32(
+                    x, fg, x_fp8, bufs['final_res_f32'],
+                    Se, D, as_gu, stream)
+                materialized_post_attn_res_f32 = True
+            else:
+                fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
+                                                              Se, D, as_gu, stream)
 
             # ── 8. Gate+Up merged GEMM (T1 tile for L2 optimization) ──
             fvk.cutlass_fp8_t1(x_fp8, weights['gate_w'][l], gate,
@@ -529,6 +547,19 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             # ── 10. Down GEMM ──
             fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
                                   Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
+            if (
+                last
+                and materialize_output
+                and bufs.get('final_fg_f32') is not None
+                and hasattr(fvk, 'cutlass_fp8_wide_f32out')
+            ):
+                # Side-channel final FFN down in FP32. The normal FP16 down
+                # above is kept for the original decoder/action path; DVT2
+                # final-feature materialization uses this stable branch.
+                fvk.cutlass_fp8_wide_f32out(
+                    hid_fp8, weights['down_w'][l], bufs['final_fg_f32'],
+                    Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
+                materialized_final_fg_f32 = True
 
             if l < L - 1:
                 # ── 11. Residual + RMSNorm → FP8 for next layer (noweight) ──
@@ -536,9 +567,46 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
                 fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
                                                               Se, D, as_next, stream)
             else:
+                if (
+                    materialize_output
+                    and materialized_post_attn_res_f32
+                    and materialized_final_fg_f32
+                    and hasattr(fvk, 'residual_add_f32_f32_rms_norm_fp16')
+                ):
+                    # Fully-stable side-channel final hidden state:
+                    # RMSNorm(FP32 post-attention residual + FP32 FFN down).
+                    fvk.residual_add_f32_f32_rms_norm_fp16(
+                        bufs['final_res_f32'], bufs['final_fg_f32'],
+                        weights['final_norm_w'], bufs['x_out'],
+                        Se, D, 1e-6, stream)
+                    materialized_output_direct = True
+                elif (
+                    materialize_output
+                    and materialized_post_attn_res_f32
+                    and hasattr(fvk, 'residual_add_f32_fp16_rms_norm_fp16')
+                ):
+                    # Stable DVT2 side-channel final hidden state:
+                    # RMSNorm(FP32 post-attention residual + FP16 FFN down).
+                    fvk.residual_add_f32_fp16_rms_norm_fp16(
+                        bufs['final_res_f32'], fg, weights['final_norm_w'],
+                        bufs['x_out'], Se, D, 1e-6, stream)
+                    materialized_output_direct = True
+                elif (
+                    materialize_output
+                    and hasattr(fvk, 'residual_add_fp16_fp16_rms_norm_fp16')
+                ):
+                    # Side-channel final hidden state for DVT2 heads. Compute
+                    # final residual in FP32 and RMSNorm it before the legacy
+                    # FP16 residual_add mutates x. This avoids FP16 overflow in
+                    # checkpoints with large final residuals without changing
+                    # the decoder/action graph.
+                    fvk.residual_add_fp16_fp16_rms_norm_fp16(
+                        x, fg, weights['final_norm_w'], bufs['x_out'],
+                        Se, D, 1e-6, stream)
+                    materialized_output_direct = True
                 fvk.residual_add_fp16(x, fg, Se * D, stream)
 
-    if materialize_output:
+    if materialize_output and not materialized_output_direct:
         fvk.rms_norm_fp16(
             x, weights['final_norm_w'], bufs['x_out'],
             Se, D, 1e-6, stream)

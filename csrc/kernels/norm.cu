@@ -762,6 +762,211 @@ void residual_add_rms_norm_fp8_noweight_fp16(__half* residual, const __half* x,
         residual, x, out, dim, d_scale);
 }
 
+__global__ void res_rms_fp8_noweight_save_f32_kernel(
+    __half* residual,
+    const __half* x,
+    __nv_fp8_e4m3* out,
+    float* residual_f32,
+    int D,
+    const float* descale_ptr) {
+    int r = blockIdx.x;
+    __half* res_row = residual + r * D;
+    const __half* x_row = x + r * D;
+    __nv_fp8_e4m3* orow = out + r * D;
+    float* save_row = residual_f32 + r * D;
+    int D2 = D / 2;
+
+    __half2* res2w = reinterpret_cast<__half2*>(res_row);
+    const __half2* res2 = reinterpret_cast<const __half2*>(res_row);
+    const __half2* x2 = reinterpret_cast<const __half2*>(x_row);
+
+    float cache[RMS_NW_ELEMS_PER_THREAD];
+    float ssq = 0.0f;
+#pragma unroll
+    for (int it = 0; it < RMS_NW_ELEMS_PER_THREAD / 2; it++) {
+        int c2 = threadIdx.x + it * blockDim.x;
+        if (c2 < D2) {
+            __half2 rv2 = res2[c2], xv2 = x2[c2];
+            float r0 = __half2float(rv2.x) + __half2float(xv2.x);
+            float r1 = __half2float(rv2.y) + __half2float(xv2.y);
+            cache[it * 2] = r0;
+            cache[it * 2 + 1] = r1;
+            save_row[c2 * 2] = r0;
+            save_row[c2 * 2 + 1] = r1;
+            res2w[c2] = __halves2half2(__float2half(r0), __float2half(r1));
+            ssq += r0 * r0 + r1 * r1;
+        } else {
+            cache[it * 2] = 0.0f;
+            cache[it * 2 + 1] = 0.0f;
+        }
+    }
+
+    __shared__ float sh[16];
+    int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(0xffffffff, ssq, o);
+    if (!lane) sh[wid] = ssq;
+    __syncthreads();
+    if (!wid) {
+        ssq = (lane < (blockDim.x / 32)) ? sh[lane] : 0.0f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(0xffffffff, ssq, o);
+    }
+    __syncthreads();
+    if (!threadIdx.x) sh[0] = ssq;
+    __syncthreads();
+
+    float scale = __frsqrt_rn(sh[0] / D + 1e-6f) / fmaxf(*descale_ptr, 1e-12f);
+
+#pragma unroll
+    for (int it = 0; it < RMS_NW_ELEMS_PER_THREAD / 2; it++) {
+        int c2 = threadIdx.x + it * blockDim.x;
+        if (c2 < D2) {
+            int c = c2 * 2;
+            __nv_fp8_e4m3 pair[2];
+            pair[0] = __nv_fp8_e4m3(fminf(fmaxf(cache[it * 2] * scale, -448.f), 448.f));
+            pair[1] = __nv_fp8_e4m3(fminf(fmaxf(cache[it * 2 + 1] * scale, -448.f), 448.f));
+            *reinterpret_cast<uint16_t*>(orow + c) = *reinterpret_cast<uint16_t*>(pair);
+        }
+    }
+}
+
+void residual_add_rms_norm_fp8_noweight_fp16_save_f32(
+    __half* residual,
+    const __half* x,
+    __nv_fp8_e4m3* out,
+    float* residual_f32,
+    int seq_len,
+    int dim,
+    const float* d_scale,
+    cudaStream_t stream) {
+    res_rms_fp8_noweight_save_f32_kernel<<<seq_len, 256, 0, stream>>>(
+        residual, x, out, residual_f32, dim, d_scale);
+}
+
+__global__ void residual_add_fp16_fp16_rms_norm_fp16_kernel(
+    const __half* __restrict__ residual,
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    int dim,
+    float eps) {
+    int row = blockIdx.x;
+    const __half* residual_row = residual + row * dim;
+    const __half* x_row = x + row * dim;
+    __half* out_row = out + row * dim;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = __half2float(residual_row[i]) + __half2float(x_row[i]);
+        local_sum += v * v;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = (__half2float(residual_row[i]) + __half2float(x_row[i]))
+                * rms
+                * __half2float(weight[i]);
+        out_row[i] = __float2half(v);
+    }
+}
+
+void residual_add_fp16_fp16_rms_norm_fp16(const __half* residual,
+                                          const __half* x,
+                                          const __half* weight,
+                                          __half* out,
+                                          int seq_len,
+                                          int dim,
+                                          float eps,
+                                          cudaStream_t stream) {
+    residual_add_fp16_fp16_rms_norm_fp16_kernel
+        <<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        residual, x, weight, out, dim, eps);
+}
+
+__global__ void residual_add_f32_fp16_rms_norm_fp16_kernel(
+    const float* __restrict__ residual,
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    int dim,
+    float eps) {
+    int row = blockIdx.x;
+    const float* residual_row = residual + row * dim;
+    const __half* x_row = x + row * dim;
+    __half* out_row = out + row * dim;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = residual_row[i] + __half2float(x_row[i]);
+        local_sum += v * v;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = (residual_row[i] + __half2float(x_row[i]))
+                * rms
+                * __half2float(weight[i]);
+        out_row[i] = __float2half(v);
+    }
+}
+
+void residual_add_f32_fp16_rms_norm_fp16(const float* residual,
+                                         const __half* x,
+                                         const __half* weight,
+                                         __half* out,
+                                         int seq_len,
+                                         int dim,
+                                         float eps,
+                                         cudaStream_t stream) {
+    residual_add_f32_fp16_rms_norm_fp16_kernel
+        <<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        residual, x, weight, out, dim, eps);
+}
+
+__global__ void residual_add_f32_f32_rms_norm_fp16_kernel(
+    const float* __restrict__ residual,
+    const float* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    int dim,
+    float eps) {
+    int row = blockIdx.x;
+    const float* residual_row = residual + row * dim;
+    const float* x_row = x + row * dim;
+    __half* out_row = out + row * dim;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = residual_row[i] + x_row[i];
+        local_sum += v * v;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = (residual_row[i] + x_row[i])
+                * rms
+                * __half2float(weight[i]);
+        out_row[i] = __float2half(v);
+    }
+}
+
+void residual_add_f32_f32_rms_norm_fp16(const float* residual,
+                                        const float* x,
+                                        const __half* weight,
+                                        __half* out,
+                                        int seq_len,
+                                        int dim,
+                                        float eps,
+                                        cudaStream_t stream) {
+    residual_add_f32_f32_rms_norm_fp16_kernel
+        <<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        residual, x, weight, out, dim, eps);
+}
+
 // ── BF16 noweight variants ──
 // For models with activations exceeding FP16 range (>65504).
 // BF16 residual stream can store up to 3.4e38.

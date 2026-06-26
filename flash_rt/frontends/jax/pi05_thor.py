@@ -461,6 +461,8 @@ class Pi05JaxFrontendThor:
         self.enc_act_amax = CB.device_zeros(1, np.float32)
         self.enc_norm_buf = CB.device_empty(Se_max * max(De, He), fp16)
         self.enc_final_out = CB.device_empty(Se_max * De, fp16)
+        self.enc_final_res_f32 = CB.device_empty(Se_max * De, np.float32)
+        self.enc_final_fg_f32 = CB.device_empty(Se_max * De, np.float32)
         self.enc_x = CB.device_empty(Se_max * De, fp16)
         self.enc_rope = CB.device_empty(Se_max * 256, fp16)
 
@@ -1011,6 +1013,8 @@ class Pi05JaxFrontendThor:
         self.enc_act_amax = CB.device_zeros(1, np.float32)
         self.enc_norm_buf = CB.device_empty(Se_max * max(De, He), fp16)
         self.enc_final_out = CB.device_empty(Se_max * De, fp16)
+        self.enc_final_res_f32 = CB.device_empty(Se_max * De, np.float32)
+        self.enc_final_fg_f32 = CB.device_empty(Se_max * De, np.float32)
         self.enc_x = CB.device_empty(Se_max * De, fp16)
         self.enc_rope = CB.device_empty(Se_max * 256, fp16)
 
@@ -1368,6 +1372,59 @@ class Pi05JaxFrontendThor:
             "thor_prompt_buffer_update_ms": (t_rope - t0) * 1000,
         })
 
+    def _sanitize_calibration_scales(self, scales, *, label: str) -> np.ndarray:
+        """Ensure FP8 calibration scales are finite positive float32 values.
+
+        Dynamic calibration can produce ``inf`` for a tensor whose observed
+        activation overflows during shadow quantization. Letting that value
+        reach ``alpha_host`` poisons the following layer output with nonfinite
+        features. Replace only invalid entries, using the same modulo-4 scale
+        slot across layers as the closest stable estimate.
+        """
+        arr = np.asarray(scales, dtype=np.float32).copy()
+        if arr.ndim != 1:
+            arr = arr.reshape(-1).astype(np.float32, copy=True)
+        good = np.isfinite(arr) & (arr > 0.0)
+        if bool(good.all()):
+            return arr
+
+        bad_idx = np.flatnonzero(~good)
+        replacements = []
+        all_good_values = arr[good]
+        global_replacement = (
+            float(np.median(all_good_values.astype(np.float64)))
+            if all_good_values.size
+            else 1.0e-3
+        )
+        global_replacement = max(global_replacement, 1.0e-12)
+
+        for idx in bad_idx:
+            slot = int(idx % 4)
+            same_slot = arr[slot::4]
+            same_slot = same_slot[np.isfinite(same_slot) & (same_slot > 0.0)]
+            if same_slot.size:
+                replacement = float(np.median(same_slot.astype(np.float64)))
+            else:
+                replacement = global_replacement
+            replacement = max(replacement, 1.0e-12)
+            arr[idx] = np.float32(replacement)
+            replacements.append((int(idx), float(replacement)))
+
+        logger.warning(
+            "Sanitized %s calibration scales: %d invalid entries; first replacements=%s",
+            label,
+            int(bad_idx.size),
+            replacements[:8],
+        )
+        return arr
+
+    def _compute_enc_alpha_host(self, enc_scales_np: np.ndarray) -> list:
+        enc_ws_np = self.enc_w_dev.download_new((self.Le * 4,), np.float32)
+        return [
+            float(np.float32(enc_scales_np[i]) * np.float32(enc_ws_np[i]))
+            for i in range(self.Le * 4)
+        ]
+
     def debug_prompt_stats(self):
         return {
             "prompt_mode": self.prompt_mode,
@@ -1651,7 +1708,9 @@ class Pi05JaxFrontendThor:
              'attn_out': self.enc_buf[3].ptr.value, 'o_fp8': self.enc_buf[5].ptr.value,
              'gate': self.enc_buf[6].ptr.value, 'hidden': self.enc_buf[7].ptr.value,
              'hid_fp8': self.enc_buf[9].ptr.value, 'fg': self.enc_buf[10].ptr.value,
-             'ctx': self._ctx, 'x_out': self.enc_final_out.ptr.value},
+             'ctx': self._ctx, 'x_out': self.enc_final_out.ptr.value,
+             'final_res_f32': self.enc_final_res_f32.ptr.value,
+             'final_fg_f32': self.enc_final_fg_f32.ptr.value},
             {'qkv_w': [self.ew[0].ptr.value + i * self.De * 2560 for i in range(self.Le)],
              'o_w': [self.ew[1].ptr.value + i * self.De * self.De for i in range(self.Le)],
              'gate_w': [self.ew[2].ptr.value + i * self.De * self.He * 2 for i in range(self.Le)],
@@ -1709,6 +1768,10 @@ class Pi05JaxFrontendThor:
         if cached is not None:
             enc_scales_np = np.array(cached["enc_scales"], dtype=np.float32)
             ae_scales_np = np.array(cached["ae_scales"], dtype=np.float32)
+            enc_scales_np = self._sanitize_calibration_scales(
+                enc_scales_np, label="encoder cache")
+            ae_scales_np = self._sanitize_calibration_scales(
+                ae_scales_np, label="decoder cache")
             if self._dvt2_enabled:
                 last_post = enc_scales_np[(Le - 1) * 4 + 1:(Le - 1) * 4 + 4]
                 if last_post.size != 3 or not bool(np.all(np.isfinite(last_post) & (last_post > 0.0))):
@@ -1718,10 +1781,7 @@ class Pi05JaxFrontendThor:
             if cached is not None:
                 self.enc_calib_scales = CB.from_numpy_managed(enc_scales_np)
                 self.ae_calib_scales = CB.from_numpy_managed(ae_scales_np)
-                enc_ws_np = self.enc_w_dev.download_new((Le * 4,), np.float32)
-                self.enc_alpha_host = [
-                    float(np.float32(enc_scales_np[i]) * np.float32(enc_ws_np[i]))
-                    for i in range(Le * 4)]
+                self.enc_alpha_host = self._compute_enc_alpha_host(enc_scales_np)
                 logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
                             Le * 4, La * 4)
                 self.calibrated = True
@@ -1775,8 +1835,10 @@ class Pi05JaxFrontendThor:
             enc_scales_buf.ptr.value, stream=stream_int)
         _cudart.cudaStreamSynchronize(stream)
 
-        self.enc_calib_scales = enc_scales_buf
         enc_scales_np = enc_scales_buf.download_new((Le * 4,), np.float32)
+        enc_scales_np = self._sanitize_calibration_scales(
+            enc_scales_np, label="encoder dynamic")
+        self.enc_calib_scales = CB.from_numpy_managed(enc_scales_np)
         enc_ws_np = self.enc_w_dev.download_new((Le * 4,), np.float32)
         self.enc_alpha_host = [
             float(np.float32(enc_scales_np[i]) * np.float32(enc_ws_np[i]))
@@ -1805,7 +1867,10 @@ class Pi05JaxFrontendThor:
             ae_scales_buf.ptr.value, stream=stream_int)
         _cudart.cudaStreamSynchronize(stream)
 
-        self.ae_calib_scales = ae_scales_buf
+        ae_scales_np = ae_scales_buf.download_new((La * 4,), np.float32)
+        ae_scales_np = self._sanitize_calibration_scales(
+            ae_scales_np, label="decoder dynamic")
+        self.ae_calib_scales = CB.from_numpy_managed(ae_scales_np)
         logger.info(f"Decoder calibrated: {La*4} scales")
         self.calibrated = True
 
@@ -1816,7 +1881,7 @@ class Pi05JaxFrontendThor:
                 Se=Se,
                 enc_scales=enc_scales_np.tolist(),
                 enc_alpha=self.enc_alpha_host,
-                ae_scales=ae_scales_buf.download_new((La * 4,), np.float32).tolist(),
+                ae_scales=ae_scales_np.tolist(),
                 enc_w_scales=enc_ws_np.tolist(),
             )
         except Exception as e:
@@ -3194,15 +3259,15 @@ class Pi05JaxFrontendThor:
         # Percentile-reduce along sample axis (rule C5).
         enc_final = accumulate_amax(per_sample_enc, percentile=percentile)
         ae_final = accumulate_amax(per_sample_ae, percentile=percentile)
+        enc_final = self._sanitize_calibration_scales(
+            enc_final, label="encoder multi-frame")
+        ae_final = self._sanitize_calibration_scales(
+            ae_final, label="decoder multi-frame")
 
         # Upload reduced scales + recompute alpha in float32 (rule C6).
         self.enc_calib_scales = CB.from_numpy_managed(enc_final)
         self.ae_calib_scales = CB.from_numpy_managed(ae_final)
-        enc_ws_np = self.enc_w_dev.download_new((Le * 4,), np.float32)
-        self.enc_alpha_host = [
-            float(np.float32(enc_final[i]) * np.float32(enc_ws_np[i]))
-            for i in range(Le * 4)
-        ]
+        self.enc_alpha_host = self._compute_enc_alpha_host(enc_final)
 
         # Recapture graph with fresh scales baked in (rule C7).
         self._capture_enc_ae_graph()
@@ -3276,12 +3341,11 @@ class Pi05JaxFrontendThor:
             enc_scales_buf.ptr.value, stream=stream_int)
         _cudart.cudaStreamSynchronize(stream)
 
-        self.enc_calib_scales = enc_scales_buf
         enc_scales_np = enc_scales_buf.download_new((Le * 4,), np.float32)
-        enc_ws_np = self.enc_w_dev.download_new((Le * 4,), np.float32)
-        self.enc_alpha_host = [
-            float(np.float32(enc_scales_np[i]) * np.float32(enc_ws_np[i]))
-            for i in range(Le * 4)]
+        enc_scales_np = self._sanitize_calibration_scales(
+            enc_scales_np, label="encoder real-data")
+        self.enc_calib_scales = CB.from_numpy_managed(enc_scales_np)
+        self.enc_alpha_host = self._compute_enc_alpha_host(enc_scales_np)
 
         # Decoder recalibration
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
@@ -3304,7 +3368,10 @@ class Pi05JaxFrontendThor:
             ae_scales_buf.ptr.value, stream=stream_int)
         _cudart.cudaStreamSynchronize(stream)
 
-        self.ae_calib_scales = ae_scales_buf
+        ae_scales_np = ae_scales_buf.download_new((La * 4,), np.float32)
+        ae_scales_np = self._sanitize_calibration_scales(
+            ae_scales_np, label="decoder real-data")
+        self.ae_calib_scales = CB.from_numpy_managed(ae_scales_np)
 
         # Recapture graph with updated scales
         self._capture_enc_ae_graph()

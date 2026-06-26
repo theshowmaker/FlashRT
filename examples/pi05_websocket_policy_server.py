@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import logging
 import os
+from pathlib import Path
 import sys
 import time
 import traceback
@@ -134,6 +135,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
     parser.add_argument("--include-dvt2-debug", action="store_true",
                         help="Include per-frame DVT2 debug dict in websocket responses.")
+    parser.add_argument("--record-obs-dir", default=None,
+                        help="Buffer real websocket observations and save them as obs_*.npz "
+                             "to this directory when the server exits, including Ctrl-C. "
+                             "The saved files can be replayed by compare_openpi_flashrt_outputs.py.")
+    parser.add_argument("--record-obs-max-frames", type=int, default=0,
+                        help="Maximum number of observations to keep in memory for --record-obs-dir. "
+                             "0 means unlimited.")
     return parser.parse_args()
 
 
@@ -236,6 +244,93 @@ def _h10w_dual_absolute_actions(actions: np.ndarray, state: np.ndarray) -> np.nd
     return arr
 
 
+class ObservationRecorder:
+    """Record the exact preprocessed observations sent into model.predict()."""
+
+    _PASSTHROUGH_KEYS = (
+        "episode_index",
+        "frame_index",
+        "task_index",
+        "task_category",
+        "subtask_state",
+        "exist_label",
+    )
+
+    def __init__(self, out_dir: str | None, max_frames: int = 0):
+        self.out_dir = None if out_dir is None else Path(out_dir).expanduser()
+        self.max_frames = max(0, int(max_frames))
+        self.records: list[dict[str, Any]] = []
+        self.dropped = 0
+        self._saved = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.out_dir is not None
+
+    def add(
+        self,
+        *,
+        request_idx: int,
+        raw_obs: dict,
+        prompt: str,
+        images: list[np.ndarray],
+        state: np.ndarray | None,
+    ) -> None:
+        if not self.enabled:
+            return
+        if self.max_frames and len(self.records) >= self.max_frames:
+            self.dropped += 1
+            return
+
+        obs: dict[str, Any] = {"prompt": str(prompt)}
+        image_keys = (
+            "observation/image",
+            "observation/wrist_image_left",
+            "observation/wrist_image_right",
+        )
+        for key, img in zip(image_keys, images):
+            obs[key] = np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
+        if state is not None:
+            obs["observation/state"] = np.ascontiguousarray(
+                np.asarray(state, dtype=np.float32).reshape(-1))
+
+        for key in self._PASSTHROUGH_KEYS:
+            if key in raw_obs:
+                value = raw_obs[key]
+                obs[key] = (
+                    np.ascontiguousarray(value.copy())
+                    if isinstance(value, np.ndarray) else value
+                )
+
+        self.records.append({
+            "request_idx": int(request_idx),
+            "time_s": float(time.time()),
+            "obs": obs,
+            "raw_keys": list(raw_obs.keys()),
+        })
+
+    def save(self) -> None:
+        if not self.enabled or self._saved:
+            return
+        self._saved = True
+        assert self.out_dir is not None
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        for i, record in enumerate(self.records):
+            np.savez_compressed(
+                self.out_dir / f"obs_{i:06d}.npz",
+                obs=np.asarray(record["obs"], dtype=object),
+                request_idx=np.asarray(record["request_idx"], dtype=np.int64),
+                time_s=np.asarray(record["time_s"], dtype=np.float64),
+                raw_keys=np.asarray(record["raw_keys"], dtype=object),
+            )
+        logger.info(
+            "Saved %d recorded observations to %s%s",
+            len(self.records),
+            self.out_dir,
+            "" if self.dropped == 0 else f" (dropped {self.dropped} after max_frames)",
+        )
+
+
 class FlashRTPi05Policy:
     def __init__(self, args: argparse.Namespace):
         if args.force_bf16:
@@ -266,6 +361,13 @@ class FlashRTPi05Policy:
         self.load_s = time.perf_counter() - t0
         self._printed_obs_keys = False
         self.action_shape: tuple[int, ...] | None = None
+        self.obs_recorder = ObservationRecorder(
+            args.record_obs_dir, args.record_obs_max_frames)
+        if self.obs_recorder.enabled:
+            logger.info(
+                "Observation recording enabled; buffered frames will be saved to %s on exit",
+                self.obs_recorder.out_dir,
+            )
         logger.info("Model loaded in %.2fs", self.load_s)
 
     def warmup(self) -> None:
@@ -311,7 +413,8 @@ class FlashRTPi05Policy:
             bool(getattr(pipeline, "materialize_encoder_output", False))
             if pipeline is not None else dvt2_enabled
         )
-        fast_state_tokenizer = bool(getattr(pipe, "debug_prompt_stats", lambda: {})().get(
+        prompt_debug = getattr(pipe, "debug_prompt_stats", lambda: {})()
+        fast_state_tokenizer = bool(prompt_debug.get(
             "fast_state_tokenizer", os.environ.get("FLASH_RT_PI05_FAST_STATE_TOKENIZER", "1") != "0"))
         return {
             "model": "pi05",
@@ -346,7 +449,7 @@ class FlashRTPi05Policy:
             return "dvt2" if bool(getattr(pipe, "_dvt2_enabled", False)) else "none"
         return robot_type
 
-    def infer(self, obs: dict) -> dict:
+    def infer(self, obs: dict, request_idx: int = 0) -> dict:
         if self.args.log_obs_keys_once and not self._printed_obs_keys:
             logger.info("OBS keys: %s", list(obs.keys()))
             self._printed_obs_keys = True
@@ -355,6 +458,14 @@ class FlashRTPi05Policy:
         prompt = str(obs.get("prompt") or self.args.prompt)
         images = _extract_images(obs, self.args.num_views)
         state = None if self.args.ignore_state else _extract_state(obs)
+        if self.obs_recorder.enabled:
+            self.obs_recorder.add(
+                request_idx=request_idx,
+                raw_obs=obs,
+                prompt=prompt,
+                images=images,
+                state=state,
+            )
         pipe = getattr(self.model, "_pipe", None)
         # Match OpenPI StageTracker semantics: frame_index/episode_index are
         # metadata and do not reset tracker state. DVT2 tracker reset happens
@@ -407,6 +518,7 @@ async def _handler(websocket, policy: FlashRTPi05Policy, api_key: str | None):
     logger.info("Connection from %s opened", websocket.remote_address)
     await websocket.send(packb(policy.metadata()))
     prev_total_ms = None
+    request_idx = 0
 
     while True:
         try:
@@ -417,7 +529,7 @@ async def _handler(websocket, policy: FlashRTPi05Policy, api_key: str | None):
                 continue
             obs = unpackb(message)
             infer_t0 = time.perf_counter()
-            response = policy.infer(obs)
+            response = policy.infer(obs, request_idx=request_idx)
             server_infer_ms = (time.perf_counter() - infer_t0) * 1000
             response.setdefault("server_timing", {})
             response["server_timing"]["infer_ms"] = server_infer_ms
@@ -425,12 +537,14 @@ async def _handler(websocket, policy: FlashRTPi05Policy, api_key: str | None):
                 response["server_timing"]["prev_total_ms"] = prev_total_ms
             await websocket.send(packb(response))
             prev_total_ms = (time.perf_counter() - start) * 1000
+            request_idx += 1
         except ConnectionClosed:
             logger.info("Connection from %s closed", websocket.remote_address)
             break
         except Exception:
             tb = traceback.format_exc()
             logger.error("Inference failed:\n%s", tb)
+            policy.obs_recorder.save()
             try:
                 await websocket.send(tb)
                 await websocket.close(code=1011, reason="internal server error")
@@ -462,8 +576,13 @@ def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     policy = FlashRTPi05Policy(args)
-    policy.warmup()
-    asyncio.run(_run_server(args, policy))
+    try:
+        policy.warmup()
+        asyncio.run(_run_server(args, policy))
+    except KeyboardInterrupt:
+        logger.info("Interrupted; saving recorded observations before exit")
+    finally:
+        policy.obs_recorder.save()
     return 0
 
 

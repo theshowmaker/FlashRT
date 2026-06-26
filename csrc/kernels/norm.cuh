@@ -121,6 +121,51 @@ void residual_add_rms_norm_fp8_noweight_fp16(__half* residual, const __half* x,
                                                const float* d_scale,
                                                cudaStream_t stream = 0);
 
+// Same as residual_add_rms_norm_fp8_noweight_fp16, plus saves the FP32
+// residual sum before the FP16 residual stream writeback. Intended for
+// side-channel materialization when the FP16 residual stream overflows.
+void residual_add_rms_norm_fp8_noweight_fp16_save_f32(__half* residual,
+                                                       const __half* x,
+                                                       __nv_fp8_e4m3* out,
+                                                       float* residual_f32,
+                                                       int seq_len,
+                                                       int dim,
+                                                       const float* d_scale,
+                                                       cudaStream_t stream = 0);
+
+// Residual add in FP32 from two FP16 branches + weighted RMSNorm -> FP16.
+// Does not mutate either branch; intended for side-channel materialization.
+void residual_add_fp16_fp16_rms_norm_fp16(const __half* residual,
+                                          const __half* x,
+                                          const __half* weight,
+                                          __half* out,
+                                          int seq_len,
+                                          int dim,
+                                          float eps,
+                                          cudaStream_t stream = 0);
+
+// Residual add in FP32 from an FP32 residual branch and FP16 update branch,
+// then weighted RMSNorm -> FP16. Does not mutate either branch.
+void residual_add_f32_fp16_rms_norm_fp16(const float* residual,
+                                         const __half* x,
+                                         const __half* weight,
+                                         __half* out,
+                                         int seq_len,
+                                         int dim,
+                                         float eps,
+                                         cudaStream_t stream = 0);
+
+// Residual add in FP32 from two FP32 branches, then weighted RMSNorm -> FP16.
+// Used when the side-channel FFN down projection itself exceeds FP16 range.
+void residual_add_f32_f32_rms_norm_fp16(const float* residual,
+                                        const float* x,
+                                        const __half* weight,
+                                        __half* out,
+                                        int seq_len,
+                                        int dim,
+                                        float eps,
+                                        cudaStream_t stream = 0);
+
 // BF16 noweight variants — for models with activations exceeding FP16 range
 void rms_norm_fp8_noweight_bf16(const __nv_bfloat16* x, __nv_fp8_e4m3* out,
                                  int seq_len, int dim,

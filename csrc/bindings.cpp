@@ -1513,6 +1513,60 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("seq_len"), py::arg("dim"),
        py::arg("d_scale"), py::arg("stream") = 0);
 
+    m.def("residual_add_rms_norm_fp8_noweight_fp16_save_f32",
+          [](uintptr_t residual, uintptr_t x, uintptr_t out,
+             uintptr_t residual_f32, int seq_len, int dim,
+             uintptr_t d_scale, uintptr_t stream) {
+        residual_add_rms_norm_fp8_noweight_fp16_save_f32(
+            reinterpret_cast<__half*>(residual),
+            reinterpret_cast<const __half*>(x),
+            typed_ptr<__nv_fp8_e4m3>(out),
+            reinterpret_cast<float*>(residual_f32),
+            seq_len, dim, reinterpret_cast<const float*>(d_scale),
+            to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("out"),
+       py::arg("residual_f32"), py::arg("seq_len"), py::arg("dim"),
+       py::arg("d_scale"), py::arg("stream") = 0);
+
+    m.def("residual_add_fp16_fp16_rms_norm_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t weight, uintptr_t out,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        residual_add_fp16_fp16_rms_norm_fp16(
+            reinterpret_cast<const __half*>(residual),
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(weight),
+            reinterpret_cast<__half*>(out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
+    m.def("residual_add_f32_fp16_rms_norm_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t weight, uintptr_t out,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        residual_add_f32_fp16_rms_norm_fp16(
+            reinterpret_cast<const float*>(residual),
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(weight),
+            reinterpret_cast<__half*>(out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
+    m.def("residual_add_f32_f32_rms_norm_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t weight, uintptr_t out,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        residual_add_f32_f32_rms_norm_fp16(
+            reinterpret_cast<const float*>(residual),
+            reinterpret_cast<const float*>(x),
+            reinterpret_cast<const __half*>(weight),
+            reinterpret_cast<__half*>(out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
     // Residual + RMSNorm → FP8 (FP16)
     m.def("residual_add_rms_norm_fp8_fp16", [](uintptr_t residual, uintptr_t x,
                                                  uintptr_t weight, uintptr_t out,
