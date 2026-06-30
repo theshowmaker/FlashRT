@@ -137,6 +137,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recalibrate-on-prompt-change", action="store_true",
                         help="For Thor backends, force real-data recalibration on the "
                              "request where the text prompt changes. Default is off.")
+    parser.set_defaults(use_offline_calibration_cache=True)
+    parser.add_argument("--use-offline-calibration-cache",
+                        dest="use_offline_calibration_cache",
+                        action="store_true",
+                        help="For Thor backends, require the loaded calibration cache and "
+                             "skip lazy real-data recalibration on warmup/first request. "
+                             "This is the default; the flag is kept for script compatibility.")
+    parser.add_argument("--recalibrate-on-first-real-frame",
+                        dest="use_offline_calibration_cache",
+                        action="store_false",
+                        help="Restore the older Thor behavior: after dummy warmup, run "
+                             "real-data recalibration on the first real request.")
     parser.add_argument("--log-infer-ms", action="store_true",
                         help="Log one concise server-side inference latency line per request.")
     return parser.parse_args()
@@ -272,6 +284,12 @@ class FlashRTPi05Policy:
         self._printed_obs_keys = False
         self.action_shape: tuple[int, ...] | None = None
         self._last_recalib_prompt: str | None = None
+        self._trust_offline_calibration = bool(args.use_offline_calibration_cache)
+        pipe = getattr(self.model, "_pipe", None)
+        if self._trust_offline_calibration and pipe is not None and hasattr(pipe, "_real_data_calibrated"):
+            pipe._require_calibration_cache = True
+            pipe._real_data_calibrated = True
+            logger.info("Requiring offline calibration cache; skipped initial Thor real-data recalibration")
         logger.info("Model loaded in %.2fs", self.load_s)
 
     def warmup(self) -> None:
@@ -301,8 +319,12 @@ class FlashRTPi05Policy:
             # Warmup uses synthetic images. Do not let Thor's lazy real-data
             # recalibration treat that dummy pass as representative of the
             # first real observation stream.
-            pipe._real_data_calibrated = False
-            logger.info("Reset Thor real-data calibration after dummy warmup")
+            if self._trust_offline_calibration:
+                pipe._real_data_calibrated = True
+                logger.info("Kept Thor offline calibration cache active after dummy warmup")
+            else:
+                pipe._real_data_calibrated = False
+                logger.info("Reset Thor real-data calibration after dummy warmup")
 
     def metadata(self) -> dict:
         pipe = getattr(self.model, "_pipe", None)

@@ -406,3 +406,22 @@ sudo apt install libcudnn9-cuda-13 libcudnn9-dev-cuda-13
 ls -lh flash_rt/*.so build/*.so 2>/dev/null
 rm -rf build
 rm -f flash_rt/*.so
+
+
+
+# offline calib
+rsync -av ./tmp/08b3ee89a2ab4150_Se972.json diana@10.8.24.143:~/.flash_rt/calibration
+
+rsync -av --progress tmp/0629_all_calib_obs   diana@10.8.26.61:~/vla/FlashRT/tmp
+
+
+CUDA_VISIBLE_DEVICES=0 python examples/pi05_websocket_policy_server.py   --checkpoint ~/vla/models/0617_dvt2_all/79999   --framework jax   --hardware thor   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile pi05_dvt2_fft_0605   --robot-type dvt2   --host 0.0.0.0   --port 8001   --use-offline-calibration-cache   --log-infer-ms
+
+
+CUDA_VISIBLE_DEVICES=0 python examples/pi05_thor_offline_calibrate.py   --checkpoint ~/vla/models/0617_dvt2_all/79999   --obs-glob "tmp/0629_all_calib_obs/*.npz"   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile pi05_dvt2_fft_0605   --percentile 99.9   --max-samples 256   --clear-existing   --verbose   --debug-calibration   --calibration-debug-topk 12
+
+CUDA_VISIBLE_DEVICES=0 python examples/pi05_thor_offline_calibrate.py   --checkpoint ~/vla/models/0617_dvt2_all/79999   --obs-glob "tmp/0629_all_calib_obs/*.npz"   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile pi05_dvt2_fft_0605   --percentile 99.9   --max-samples 256   --clear-existing   --verbose
+
+(hl-policy) peng@10-0-1-180:~/peng.song/high-level-policy/tmp4FlashRT$ python tmp4FlashRT/extract_lerobot_calib_obs.py   --dataset /DATA/disk0/huggingface/lerobot/0629_all   --out-dir tmp/0629_all_calib_obs   --count 256   --num-views 3   --require-state-dim 16   --dry-run
+
+(hl-policy) peng@10-0-1-180:~/peng.song/high-level-policy/tmp4FlashRT$ python tmp4FlashRT/extract_lerobot_calib_obs.py   --dataset /DATA/disk0/huggingface/lerobot/0629_all   --out-dir tmp/0629_all_calib_obs   --count 256   --num-views 3   --require-state-dim 16   --max-episodes-per-task 8   --seed 0   --overwrite

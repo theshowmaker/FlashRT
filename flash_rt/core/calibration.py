@@ -64,6 +64,84 @@ def accumulate_amax(per_sample_amax: List[np.ndarray],
     return np.percentile(stacked, percentile, axis=0).astype(np.float32)
 
 
+def accumulate_amax_finite(
+    per_sample_amax: List[np.ndarray],
+    percentile: float = 99.9,
+    *,
+    return_info: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict]:
+    """Finite-aware variant of :func:`accumulate_amax`.
+
+    Each quantization point is reduced independently after filtering out
+    ``nan``, ``inf``, and non-positive values from that column. This keeps one
+    bad calibration frame from poisoning the percentile for an otherwise
+    healthy point. Columns with no finite positive samples are left as ``nan``
+    so the backend's final sanitation/fallback policy can decide how to fill
+    them.
+    """
+    if not per_sample_amax:
+        raise ValueError("per_sample_amax must contain at least one entry")
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError(f"percentile must be in [0, 100], got {percentile}")
+    stacked = np.stack([np.asarray(a, dtype=np.float64) for a in per_sample_amax],
+                       axis=0)
+    if stacked.ndim != 2:
+        raise ValueError(
+            f"each per-sample amax must be 1-D, got shapes "
+            f"{[a.shape for a in per_sample_amax]}")
+
+    good = np.isfinite(stacked) & (stacked > 0.0)
+    final = np.empty(stacked.shape[1], dtype=np.float64)
+    final.fill(np.nan)
+    for i in range(stacked.shape[1]):
+        values = stacked[good[:, i], i]
+        if values.size:
+            final[i] = np.percentile(values, percentile)
+
+    out = final.astype(np.float32)
+    if not return_info:
+        return out
+
+    bad_counts = (~good).sum(axis=0).astype(np.int64)
+    finite_counts = good.sum(axis=0).astype(np.int64)
+    info = {
+        "num_samples": int(stacked.shape[0]),
+        "num_points": int(stacked.shape[1]),
+        "total_bad_values": int(bad_counts.sum()),
+        "num_points_with_bad_values": int((bad_counts > 0).sum()),
+        "num_points_without_finite_values": int((finite_counts == 0).sum()),
+        "bad_counts": bad_counts,
+        "finite_counts": finite_counts,
+    }
+    return out, info
+
+
+def format_finite_amax_report(info: dict, *, label: str, topk: int = 8) -> str:
+    """One-line debug rendering for :func:`accumulate_amax_finite` info."""
+    bad_counts = np.asarray(info.get("bad_counts", []), dtype=np.int64)
+    finite_counts = np.asarray(info.get("finite_counts", []), dtype=np.int64)
+    if bad_counts.size == 0:
+        top = ""
+    else:
+        order = np.argsort(-bad_counts)
+        items = []
+        for idx in order[:max(0, int(topk))]:
+            if int(bad_counts[idx]) <= 0:
+                continue
+            items.append(
+                f"{int(idx)}:{int(bad_counts[idx])}bad/"
+                f"{int(finite_counts[idx])}finite")
+        top = ", ".join(items)
+    return (
+        f"[{label}] finite-aware calibration reduce: "
+        f"{info['total_bad_values']} bad values across "
+        f"{info['num_points_with_bad_values']}/{info['num_points']} points; "
+        f"{info['num_points_without_finite_values']} points have no finite "
+        f"samples"
+        + (f"; top={top}" if top else "")
+    )
+
+
 def summarize_amax_dispersion(per_sample_amax: List[np.ndarray],
                               final_amax: np.ndarray) -> dict:
     """Compute dispersion stats for logging / diagnostics.

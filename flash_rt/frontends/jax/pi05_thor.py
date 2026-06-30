@@ -1755,7 +1755,12 @@ class Pi05JaxFrontendThor:
         Checks calibration cache first. On miss, runs dynamic calibration
         and saves to cache for next startup.
         """
-        from flash_rt.core.quant.calibrator import load_calibration, save_calibration
+        from flash_rt.core.quant.calibrator import (
+            _cache_path,
+            _checkpoint_hash,
+            load_calibration,
+            save_calibration,
+        )
 
         CB = self._CudaBuffer
         Se = self.Se; total_keys = self.total_keys
@@ -1764,6 +1769,12 @@ class Pi05JaxFrontendThor:
         stream_int = stream.value or 0
 
         # Try cache first
+        require_cache = bool(getattr(self, "_require_calibration_cache", False))
+        cache_path = None
+        try:
+            cache_path = _cache_path(_checkpoint_hash(self._checkpoint_path), Se)
+        except Exception:
+            cache_path = None
         cached = load_calibration(self._checkpoint_path, Se)
         if cached is not None:
             enc_scales_np = np.array(cached["enc_scales"], dtype=np.float32)
@@ -1786,6 +1797,17 @@ class Pi05JaxFrontendThor:
                             Le * 4, La * 4)
                 self.calibrated = True
                 return
+
+        if require_cache:
+            expected = str(cache_path) if cache_path is not None else (
+                f"~/.flash_rt/calibration/<checkpoint_hash>_Se{Se}.json")
+            raise RuntimeError(
+                "Required Thor calibration cache was not loaded. "
+                f"Expected cache for checkpoint={self._checkpoint_path!r}, "
+                f"Se={Se}: {expected}. "
+                "Run examples/pi05_thor_offline_calibrate.py first, copy the "
+                "matching json to this machine, or start the server with "
+                "--recalibrate-on-first-real-frame to allow dynamic calibration.")
 
         # ── Cache miss: run dynamic calibration ──
 
@@ -3125,7 +3147,7 @@ class Pi05JaxFrontendThor:
 
         Drives encoder + decoder shadow forwards over each obs in
         ``obs_list``, downloads per-tensor amax, percentile-reduces along
-        the sample axis via ``flash_rt.core.calibration.accumulate_amax``
+        the sample axis via finite-aware percentile reduction
         (framework rule C5), uploads the reduced scales, recomputes the
         enc-side alpha = act_scale * weight_scale in float32 (rule C6),
         and recaptures the enc+ae CUDA Graph (rule C7) so the new scales
@@ -3138,7 +3160,11 @@ class Pi05JaxFrontendThor:
             ``_calibrate_multi_frame`` (Phase 1 only; FP4 also runs an
             AWQ refit in Phase 2 which is FP4-specific).
         """
-        from flash_rt.core.calibration import accumulate_amax
+        from flash_rt.core.calibration import (
+            accumulate_amax_finite,
+            format_finite_amax_report,
+        )
+        from flash_rt.core.quant.calibrator import save_calibration
 
         n = len(obs_list)
         logger.info(
@@ -3256,9 +3282,30 @@ class Pi05JaxFrontendThor:
             if verbose and (i + 1) % max(1, n // 10) == 0:
                 logger.info("  sample %d/%d", i + 1, n)
 
-        # Percentile-reduce along sample axis (rule C5).
-        enc_final = accumulate_amax(per_sample_enc, percentile=percentile)
-        ae_final = accumulate_amax(per_sample_ae, percentile=percentile)
+        # Percentile-reduce along sample axis (rule C5). Filter nonfinite
+        # values per quantization point first so one bad frame does not poison
+        # the whole point's percentile. Points with no finite positive samples
+        # are intentionally left invalid for the backend sanitation fallback.
+        enc_final, enc_reduce_info = accumulate_amax_finite(
+            per_sample_enc, percentile=percentile, return_info=True)
+        ae_final, ae_reduce_info = accumulate_amax_finite(
+            per_sample_ae, percentile=percentile, return_info=True)
+        debug_topk = int(getattr(self, "_calibration_debug_topk", 0) or 0)
+        if debug_topk > 0:
+            if int(enc_reduce_info["total_bad_values"]) > 0:
+                logger.info(format_finite_amax_report(
+                    enc_reduce_info, label="encoder multi-frame", topk=debug_topk))
+            if int(ae_reduce_info["total_bad_values"]) > 0:
+                logger.info(format_finite_amax_report(
+                    ae_reduce_info, label="decoder multi-frame", topk=debug_topk))
+        else:
+            for label, info in (
+                ("encoder multi-frame", enc_reduce_info),
+                ("decoder multi-frame", ae_reduce_info),
+            ):
+                if int(info["num_points_without_finite_values"]) > 0:
+                    logger.warning(format_finite_amax_report(
+                        info, label=label, topk=8))
         enc_final = self._sanitize_calibration_scales(
             enc_final, label="encoder multi-frame")
         ae_final = self._sanitize_calibration_scales(
@@ -3267,11 +3314,25 @@ class Pi05JaxFrontendThor:
         # Upload reduced scales + recompute alpha in float32 (rule C6).
         self.enc_calib_scales = CB.from_numpy_managed(enc_final)
         self.ae_calib_scales = CB.from_numpy_managed(ae_final)
-        self.enc_alpha_host = self._compute_enc_alpha_host(enc_final)
+        enc_ws_np = self.enc_w_dev.download_new((Le * 4,), np.float32)
+        self.enc_alpha_host = [
+            float(np.float32(enc_final[i]) * np.float32(enc_ws_np[i]))
+            for i in range(Le * 4)]
 
         # Recapture graph with fresh scales baked in (rule C7).
         self._capture_enc_ae_graph()
         self._real_data_calibrated = True
+        try:
+            save_calibration(
+                checkpoint_path=self._checkpoint_path,
+                Se=Se,
+                enc_scales=enc_final.tolist(),
+                enc_alpha=self.enc_alpha_host,
+                ae_scales=ae_final.tolist(),
+                enc_w_scales=enc_ws_np.tolist(),
+            )
+        except Exception as e:
+            logger.warning("Failed to save multi-frame calibration cache: %s", e)
         logger.info(
             "Pi0.5 JAX Thor multi-frame calibrate complete (N=%d, "
             "percentile=%.2f)", n, percentile)

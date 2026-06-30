@@ -8,6 +8,8 @@ import pytest
 
 from flash_rt.core.calibration import (
     accumulate_amax,
+    accumulate_amax_finite,
+    format_finite_amax_report,
     format_summary,
     summarize_amax_dispersion,
 )
@@ -55,6 +57,36 @@ def test_percentile_out_of_range():
         accumulate_amax([np.array([1.0])], percentile=-1.0)
     with pytest.raises(ValueError):
         accumulate_amax([np.array([1.0])], percentile=101.0)
+
+
+def test_accumulate_amax_finite_ignores_nonfinite_per_point():
+    samples = [
+        np.array([1.0, 10.0, np.inf], dtype=np.float32),
+        np.array([2.0, np.inf, np.nan], dtype=np.float32),
+        np.array([np.nan, 30.0, -1.0], dtype=np.float32),
+    ]
+    out, info = accumulate_amax_finite(
+        samples, percentile=100.0, return_info=True)
+    np.testing.assert_allclose(out[:2], np.array([2.0, 30.0]), atol=1e-6)
+    assert np.isnan(out[2])
+    assert info["total_bad_values"] == 5
+    assert info["num_points_with_bad_values"] == 3
+    assert info["num_points_without_finite_values"] == 1
+
+
+def test_format_finite_amax_report_mentions_worst_points():
+    _, info = accumulate_amax_finite(
+        [
+            np.array([1.0, np.inf, np.nan]),
+            np.array([2.0, np.inf, np.nan]),
+        ],
+        percentile=99.9,
+        return_info=True,
+    )
+    msg = format_finite_amax_report(info, label="pytest", topk=2)
+    assert "pytest" in msg
+    assert "1:2bad" in msg
+    assert "2:2bad" in msg
 
 
 def test_summarize_shapes_and_keys():
