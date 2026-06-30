@@ -134,6 +134,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-obs-keys-once", action="store_true", default=True)
     parser.add_argument("--include-dvt2-debug", action="store_true",
                         help="Include per-frame DVT2 debug dict in websocket responses.")
+    parser.add_argument("--recalibrate-on-prompt-change", action="store_true",
+                        help="For Thor backends, force real-data recalibration on the "
+                             "request where the text prompt changes. Default is off.")
+    parser.add_argument("--log-infer-ms", action="store_true",
+                        help="Log one concise server-side inference latency line per request.")
     return parser.parse_args()
 
 
@@ -266,6 +271,7 @@ class FlashRTPi05Policy:
         self.load_s = time.perf_counter() - t0
         self._printed_obs_keys = False
         self.action_shape: tuple[int, ...] | None = None
+        self._last_recalib_prompt: str | None = None
         logger.info("Model loaded in %.2fs", self.load_s)
 
     def warmup(self) -> None:
@@ -360,10 +366,21 @@ class FlashRTPi05Policy:
         # Match OpenPI StageTracker semantics: frame_index/episode_index are
         # metadata and do not reset tracker state. DVT2 tracker reset happens
         # in the frontend only when the task category changes.
+        recalib_prompt_changed = (
+            bool(self.args.recalibrate_on_prompt_change)
+            and self._last_recalib_prompt is not None
+            and prompt != self._last_recalib_prompt
+        )
+        if recalib_prompt_changed and hasattr(pipe, "_real_data_calibrated"):
+            pipe._real_data_calibrated = False
+            logger.info(
+                "Prompt changed; Thor real-data recalibration will run on this request")
         prep_ms = (time.perf_counter() - prep_t0) * 1000
 
         infer_t0 = time.perf_counter()
         actions = self.model.predict(images=images, prompt=prompt, state=state)
+        if self.args.recalibrate_on_prompt_change:
+            self._last_recalib_prompt = prompt
         model_result = getattr(self.model, "last_result", None) or {}
         model_timing = getattr(self.model, "last_timing", {}) or {}
         if state is not None and not self.args.no_h10w_dual_absolute_actions:
@@ -424,6 +441,8 @@ async def _handler(websocket, policy: FlashRTPi05Policy, api_key: str | None):
             response["server_timing"]["infer_ms"] = server_infer_ms
             if prev_total_ms is not None:
                 response["server_timing"]["prev_total_ms"] = prev_total_ms
+            if policy.args.log_infer_ms:
+                logger.info("infer %.2f ms", server_infer_ms)
             await websocket.send(packb(response))
             prev_total_ms = (time.perf_counter() - start) * 1000
         except ConnectionClosed:
