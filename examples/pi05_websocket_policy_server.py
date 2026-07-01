@@ -34,6 +34,17 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger("pi05_policy_server")
 
 
+def _resize_uint8(arr: np.ndarray, height: int = 224, width: int = 224) -> np.ndarray:
+    from PIL import Image
+
+    image = Image.fromarray(arr)
+    cur_width, cur_height = image.size
+    if cur_width == width and cur_height == height:
+        return np.asarray(image, dtype=np.uint8)
+    resized = image.resize((width, height), resample=Image.BILINEAR)
+    return np.asarray(resized, dtype=np.uint8)
+
+
 def _pack_array(obj):
     if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
         raise ValueError(f"Unsupported dtype: {obj.dtype}")
@@ -161,12 +172,19 @@ def _to_hwc_uint8(img: np.ndarray) -> np.ndarray:
     # openpi ALOHA sample uses CHW; FlashRT wants HWC.
     if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
         arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim != 3 or arr.shape[-1] not in (1, 3, 4):
+        raise ValueError(f"image must be HWC with 1/3/4 channels, got shape={arr.shape}")
     if arr.dtype != np.uint8:
         if np.issubdtype(arr.dtype, np.floating):
             max_v = float(np.nanmax(arr)) if arr.size else 0.0
             if max_v <= 1.5:
                 arr = arr * 255.0
         arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape[-1] != 3:
+        from PIL import Image
+        arr = np.asarray(Image.fromarray(arr).convert("RGB"), dtype=np.uint8)
+    if arr.shape[:2] != (224, 224):
+        arr = _resize_uint8(arr, 224, 224)
     return np.ascontiguousarray(arr)
 
 

@@ -359,7 +359,7 @@ source ~/.bashrc
 nvcc --version
 
 cd FlashRT/
-python3.12 -m venv .venv
+python3.12 -m venv .venv  (可选 sudo apt update， sudo apt install python3.12-venv)
 source .venv/bin/activate
 export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 export PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
@@ -392,6 +392,7 @@ rsync -av --delete  --exclude .venv --exclude .git   --exclude build   --exclude
 
 rsync -av ~/.cache/flash_rt/paligemma_tokenizer.model    diana@10.8.24.139:~/.cache/flash_rt/
 
+(先cd到/home/peng.song/ksyun_server/models/dvt2)
 rsync -av --progress ./0617_dvt2_all  diana@10.8.24.139:~/vla/models/
 
 ## Maybe you need
@@ -415,7 +416,7 @@ rsync -av ./tmp/08b3ee89a2ab4150_Se972.json diana@10.8.24.143:~/.flash_rt/calibr
 rsync -av --progress tmp/0629_all_calib_obs   diana@10.8.26.61:~/vla/FlashRT/tmp
 
 
-CUDA_VISIBLE_DEVICES=0 python examples/pi05_websocket_policy_server.py   --checkpoint ~/vla/models/0617_dvt2_all/79999   --framework jax   --hardware thor   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile pi05_dvt2_fft_0605   --robot-type dvt2   --host 0.0.0.0   --port 8001   --use-offline-calibration-cache   --log-infer-ms
+CUDA_VISIBLE_DEVICES=0 python examples/pi05_websocket_policy_server.py   --checkpoint ~/vla/models/0617_dvt2_all/79999   --framework jax   --hardware thor   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile pi05_dvt2_fft_0605   --robot-type dvt2   --host 0.0.0.0   --port 8001   --use-offline-calibration-cache(已改成默认，不用显式加)   --log-infer-ms 
 
 
 CUDA_VISIBLE_DEVICES=0 python examples/pi05_thor_offline_calibrate.py   --checkpoint ~/vla/models/0617_dvt2_all/79999   --obs-glob "tmp/0629_all_calib_obs/*.npz"   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile pi05_dvt2_fft_0605   --percentile 99.9   --max-samples 256   --clear-existing   --verbose   --debug-calibration   --calibration-debug-topk 12
@@ -425,3 +426,21 @@ CUDA_VISIBLE_DEVICES=0 python examples/pi05_thor_offline_calibrate.py   --checkp
 (hl-policy) peng@10-0-1-180:~/peng.song/high-level-policy/tmp4FlashRT$ python tmp4FlashRT/extract_lerobot_calib_obs.py   --dataset /DATA/disk0/huggingface/lerobot/0629_all   --out-dir tmp/0629_all_calib_obs   --count 256   --num-views 3   --require-state-dim 16   --dry-run
 
 (hl-policy) peng@10-0-1-180:~/peng.song/high-level-policy/tmp4FlashRT$ python tmp4FlashRT/extract_lerobot_calib_obs.py   --dataset /DATA/disk0/huggingface/lerobot/0629_all   --out-dir tmp/0629_all_calib_obs   --count 256   --num-views 3   --require-state-dim 16   --max-episodes-per-task 8   --seed 0   --overwrite
+
+# launch from a certain thor
+
+cd ~/vla/FlashRT
+source .venv/bin/activate
+python examples/pi05_websocket_policy_server.py \
+  --checkpoint ~/vla/models/0617_dvt2_all/79999  \
+  --framework jax \
+  --hardware thor \
+  --num-views 3 \
+  --chunk-size 50 \
+  --prompt-mode openpi_masked_fixed200 \
+  --fixed-state-prompt-len 200 \
+  --policy-profile pi05_dvt2_fft_0605 \
+  --robot-type dvt2 \
+  --host 0.0.0.0 \
+  --port 8001
+
