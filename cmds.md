@@ -444,3 +444,5 @@ python examples/pi05_websocket_policy_server.py \
   --host 0.0.0.0 \
   --port 8001
 
+
+--checkpoint ~/vla/models/0629_dvt2_all/78000
