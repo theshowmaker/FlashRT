@@ -407,9 +407,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             per-length cache, ``"fixed"`` uses fixed_state_prompt_len without
             attention masking, and ``"openpi_masked_fixed200"`` uses a fixed
             200-token state prompt with OpenPI-style prefix padding masks.
-        policy_profile: Pi0.5 RTX only. ``"auto"`` detects DVT2/System2
+        policy_profile: Pi0.5 RTX/Thor only. ``"auto"`` detects DVT2/System2
             checkpoints from ``train_config_full.json``; ``"none"`` disables
-            policy-side heads; ``"pi05_dvt2_fft_0605"`` forces the DVT2 profile.
+            policy-side heads; ``"pi05_dvt2_fft_0605"`` and
+            ``"pi05_dvt2_fft_0629"`` force the DVT2 profile.
 
     Returns:
         VLAModel instance with .predict() method.

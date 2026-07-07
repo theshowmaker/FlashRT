@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
                              "uses fixed 200-token state prompts plus OpenPI-style "
                              "prefix padding masks on supported RTX/Thor builds.")
     parser.add_argument("--policy-profile", default="auto",
-                        choices=["auto", "none", "pi05_dvt2_fft_0605"],
+                        choices=["auto", "none", "pi05_dvt2_fft_0605", "pi05_dvt2_fft_0629"],
                         help="Policy-side profile. auto enables DVT2/System2 heads "
                              "when detected in train_config_full.json.")
     parser.add_argument("--robot-type", default="auto",

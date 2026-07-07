@@ -35,7 +35,6 @@ import torch.nn.functional as F
 
 from flash_rt.core.utils.actions import unnormalize_actions
 from flash_rt.core.utils.dvt2_policy import (
-    PROFILE_DVT2_0605,
     DVT2Profile,
     exist_prediction_torch,
     make_stage_fusion_tokens_torch,
@@ -525,7 +524,11 @@ class Pi05TorchFrontendRtx:
         )
         self._dvt2_enabled = self.dvt2_profile is not None
         if self._dvt2_enabled:
-            logger.info("Enabled Pi0.5 DVT2 policy profile (%s)", PROFILE_DVT2_0605)
+            logger.info(
+                "Enabled Pi0.5 DVT2 policy profile (%s, exist=%s)",
+                self.policy_profile_name,
+                bool(getattr(self.dvt2_profile, "use_exist_prediction", True)),
+            )
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
@@ -793,12 +796,10 @@ class Pi05TorchFrontendRtx:
         }
 
     def _collect_dvt2_weights(self) -> Optional[dict]:
-        required = (
+        required = [
             "stage_task_embed",
             "stage_mlp_1_w", "stage_mlp_1_b",
             "stage_mlp_2_w", "stage_mlp_2_b",
-            "exist_mlp_1_w", "exist_mlp_1_b",
-            "exist_mlp_2_w", "exist_mlp_2_b",
             "stage_class_embeddings",
             "task_stage_embeddings",
             "gate_sincos_w", "gate_sincos_b",
@@ -807,9 +808,14 @@ class Pi05TorchFrontendRtx:
             "fusion_layer1_w", "fusion_layer1_b",
             "fusion_layer2_w", "fusion_layer2_b",
             "stage_projection_w", "stage_projection_b",
-        )
+        ]
         if not self._dvt2_enabled:
             return None
+        if bool(getattr(self.dvt2_profile, "use_exist_prediction", True)):
+            required.extend([
+                "exist_mlp_1_w", "exist_mlp_1_b",
+                "exist_mlp_2_w", "exist_mlp_2_b",
+            ])
         missing = [k for k in required if k not in self._ckpt_bf16]
         if missing:
             logger.error("Missing DVT2 policy weights: %s", missing)
@@ -931,13 +937,18 @@ class Pi05TorchFrontendRtx:
                 profile,
             )
             pred_stage = int(torch.argmax(logits).item())
-            exist_pred, exist_prob = exist_prediction_torch(
-                base_pooled,
-                prompt_pooled,
-                self._dvt2_weights,
-            )
-            exist_i = int(exist_pred.item())
-            output_stage = -1 if exist_i == 0 else pred_stage
+            use_exist_prediction = bool(
+                getattr(profile, "use_exist_prediction", True))
+            exist_i = 1
+            exist_prob = None
+            if use_exist_prediction:
+                exist_pred, exist_prob = exist_prediction_torch(
+                    base_pooled,
+                    prompt_pooled,
+                    self._dvt2_weights,
+                )
+                exist_i = int(exist_pred.item())
+            output_stage = -1 if use_exist_prediction and exist_i == 0 else pred_stage
             normalized = normalize_stage(output_stage, self._dvt2_task_category, profile)
             self._dvt2_current_stage = int(
                 np.clip(
@@ -951,9 +962,12 @@ class Pi05TorchFrontendRtx:
             "subtask_logits": logits.float().cpu().numpy().astype(np.float32),
             "predicted_stage": np.asarray(output_stage, dtype=np.int32),
             "stage": np.asarray(normalized, dtype=np.float32 if output_stage != -1 else np.int32),
-            "exist": np.asarray(exist_i, dtype=np.int32),
-            "exist_prob": exist_prob.float().cpu().numpy().astype(np.float32),
         }
+        if use_exist_prediction:
+            result.update({
+                "exist": np.asarray(exist_i, dtype=np.int32),
+                "exist_prob": exist_prob.float().cpu().numpy().astype(np.float32),
+            })
         debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
         debug.update(
             {
@@ -967,6 +981,7 @@ class Pi05TorchFrontendRtx:
                     getattr(self.pipeline, "materialize_encoder_output", False)
                 ),
                 "openpi_fixed_hole_rope": True,
+                "use_exist_prediction": bool(use_exist_prediction),
             }
         )
         result["dvt2_debug"] = debug

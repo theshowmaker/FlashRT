@@ -56,7 +56,6 @@ import jax.numpy as jnp
 
 from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN  # noqa: E402
 from flash_rt.core.utils.dvt2_policy import (  # noqa: E402
-    PROFILE_DVT2_0605,
     DVT2Profile,
     exist_prediction_numpy,
     make_stage_fusion_tokens_numpy,
@@ -104,7 +103,11 @@ class Pi05JaxFrontendThor:
             self.policy_profile_name, checkpoint_dir)
         self._dvt2_enabled = self.dvt2_profile is not None
         if self._dvt2_enabled:
-            logger.info("Enabled Pi0.5 DVT2 policy profile on Thor (%s)", PROFILE_DVT2_0605)
+            logger.info(
+                "Enabled Pi0.5 DVT2 policy profile on Thor (%s, exist=%s)",
+                self.policy_profile_name,
+                bool(getattr(self.dvt2_profile, "use_exist_prediction", True)),
+            )
         self.prompt_mode = str(kwargs.get("prompt_mode", "bucketed") or "bucketed")
         valid_prompt_modes = {"bucketed", "fixed", "openpi_masked_fixed200"}
         if self.prompt_mode not in valid_prompt_modes:
@@ -587,9 +590,15 @@ class Pi05JaxFrontendThor:
                 setattr(self, attr, np.asarray(engine_w[key], dtype=np.float32))
         self._dvt2_weights_np = self._collect_dvt2_weights_np()
         if self._dvt2_enabled and self._dvt2_weights_np is None:
+            use_exist_prediction = bool(
+                getattr(self.dvt2_profile, "use_exist_prediction", True))
+            required_missing = [
+                key for key in missing
+                if use_exist_prediction or not key.startswith("exist_mlp_")
+            ]
             raise ValueError(
                 "DVT2 policy profile is enabled on Thor, but the Orbax checkpoint "
-                f"is missing one or more policy head weights: {missing}"
+                f"is missing one or more policy head weights: {required_missing}"
             )
         if self._dvt2_weights_np is not None:
             logger.info("Loaded DVT2/System2 policy heads for Thor JAX")
@@ -601,10 +610,6 @@ class Pi05JaxFrontendThor:
             "stage_mlp_1_b": "_dvt2_stage_mlp_1_b_np",
             "stage_mlp_2_w": "_dvt2_stage_mlp_2_w_np",
             "stage_mlp_2_b": "_dvt2_stage_mlp_2_b_np",
-            "exist_mlp_1_w": "_dvt2_exist_mlp_1_w_np",
-            "exist_mlp_1_b": "_dvt2_exist_mlp_1_b_np",
-            "exist_mlp_2_w": "_dvt2_exist_mlp_2_w_np",
-            "exist_mlp_2_b": "_dvt2_exist_mlp_2_b_np",
             "stage_class_embeddings": "_dvt2_stage_class_embeddings_np",
             "task_stage_embeddings": "_dvt2_task_stage_embeddings_np",
             "gate_sincos_w": "_dvt2_gate_sincos_w_np",
@@ -620,6 +625,13 @@ class Pi05JaxFrontendThor:
             "stage_projection_w": "_dvt2_stage_projection_w_np",
             "stage_projection_b": "_dvt2_stage_projection_b_np",
         }
+        if bool(getattr(self.dvt2_profile, "use_exist_prediction", True)):
+            required.update({
+                "exist_mlp_1_w": "_dvt2_exist_mlp_1_w_np",
+                "exist_mlp_1_b": "_dvt2_exist_mlp_1_b_np",
+                "exist_mlp_2_w": "_dvt2_exist_mlp_2_w_np",
+                "exist_mlp_2_b": "_dvt2_exist_mlp_2_b_np",
+            })
         weights = {}
         for key, attr in required.items():
             arr = getattr(self, attr, None)
@@ -640,15 +652,26 @@ class Pi05JaxFrontendThor:
 
         weights = self._dvt2_weights_np
         try:
+            use_exist_prediction = bool(
+                getattr(self.dvt2_profile, "use_exist_prediction", True))
             stage_task = np.ascontiguousarray(weights["stage_task_embed"], dtype=np.float32)
             stage_w1 = np.ascontiguousarray(weights["stage_mlp_1_w"], dtype=np.float32)
             stage_b1 = np.ascontiguousarray(weights["stage_mlp_1_b"], dtype=np.float32)
             stage_w2 = np.ascontiguousarray(weights["stage_mlp_2_w"], dtype=np.float32)
             stage_b2 = np.ascontiguousarray(weights["stage_mlp_2_b"], dtype=np.float32)
-            exist_w1 = np.ascontiguousarray(weights["exist_mlp_1_w"], dtype=np.float32)
-            exist_b1 = np.ascontiguousarray(weights["exist_mlp_1_b"], dtype=np.float32)
-            exist_w2 = np.ascontiguousarray(weights["exist_mlp_2_w"], dtype=np.float32)
-            exist_b2 = np.ascontiguousarray(weights["exist_mlp_2_b"], dtype=np.float32)
+            if use_exist_prediction:
+                exist_w1 = np.ascontiguousarray(weights["exist_mlp_1_w"], dtype=np.float32)
+                exist_b1 = np.ascontiguousarray(weights["exist_mlp_1_b"], dtype=np.float32)
+                exist_w2 = np.ascontiguousarray(weights["exist_mlp_2_w"], dtype=np.float32)
+                exist_b2 = np.ascontiguousarray(weights["exist_mlp_2_b"], dtype=np.float32)
+            else:
+                # The current CUDA helper computes stage and exist together.
+                # No-exist checkpoints use dummy exist weights only to satisfy
+                # that ABI; the websocket/model result drops exist outputs.
+                exist_w1 = np.zeros((self.De * 2, 1), dtype=np.float32)
+                exist_b1 = np.zeros((1,), dtype=np.float32)
+                exist_w2 = np.zeros((1,), dtype=np.float32)
+                exist_b2 = np.ones((1,), dtype=np.float32)
             stage_class = np.ascontiguousarray(weights["stage_class_embeddings"], dtype=np.float32)
             task_stage = np.ascontiguousarray(weights["task_stage_embeddings"], dtype=np.float32)
             gate_sincos_w = np.ascontiguousarray(weights["gate_sincos_w"], dtype=np.float32)
@@ -670,16 +693,22 @@ class Pi05JaxFrontendThor:
             sub_dim = int(stage_class.shape[1])
             fusion_input = int(self.De + sub_dim * 2)
             fusion_hidden = int(fusion_layer1_w.shape[1])
-            if (
+            stage_shape_bad = (
                 stage_w1.shape != (self.De + task_dim, stage_hidden)
                 or stage_b1.shape != (stage_hidden,)
                 or stage_w2.shape != (stage_hidden, stage_logits)
                 or stage_b2.shape != (stage_logits,)
-                or exist_w1.shape != (self.De * 2, exist_hidden)
-                or exist_b1.shape != (exist_hidden,)
-                or exist_w2.shape not in {(exist_hidden, 1), (exist_hidden,)}
-                or exist_b2.size != 1
-            ):
+            )
+            exist_shape_bad = (
+                use_exist_prediction
+                and (
+                    exist_w1.shape != (self.De * 2, exist_hidden)
+                    or exist_b1.shape != (exist_hidden,)
+                    or exist_w2.shape not in {(exist_hidden, 1), (exist_hidden,)}
+                    or exist_b2.size != 1
+                )
+            )
+            if stage_shape_bad or exist_shape_bad:
                 logger.warning(
                     "DVT2 GPU head disabled due to unexpected weight shapes: "
                     "stage_task=%s stage_w1=%s stage_w2=%s exist_w1=%s exist_w2=%s",
@@ -754,6 +783,7 @@ class Pi05JaxFrontendThor:
             "exist_hidden": exist_hidden,
             "sub_dim": sub_dim,
             "fusion_hidden": fusion_hidden,
+            "use_exist_prediction": use_exist_prediction,
         }
         self._dvt2_head_gpu_enabled = bool(stage_head_ok)
         self._dvt2_fusion_gpu_enabled = bool(fusion_ok)
@@ -3586,6 +3616,7 @@ class Pi05JaxFrontendThor:
         exist_prob = np.asarray(head_result[stage_logits_n], dtype=np.float32).reshape(())
         exist_i = int(head_result[stage_logits_n + 1] > 0.5)
         prefix_nonfinite = int(max(0.0, head_result[stage_logits_n + 2]))
+        use_exist_prediction = bool(g.get("use_exist_prediction", True))
         self.last_timing.update({
             "thor_dvt2_head_launch_ms": (launch_t1 - launch_t0) * 1000,
             "thor_dvt2_head_download_ms": (download_t1 - download_t0) * 1000,
@@ -3593,7 +3624,7 @@ class Pi05JaxFrontendThor:
         })
 
         pred_stage = int(np.argmax(logits))
-        output_stage = -1 if exist_i == 0 else pred_stage
+        output_stage = -1 if use_exist_prediction and exist_i == 0 else pred_stage
         normalized = normalize_stage(output_stage, self._dvt2_task_category, profile)
         condition_stage = int(self._dvt2_current_stage)
         self._dvt2_current_stage = int(
@@ -3607,9 +3638,12 @@ class Pi05JaxFrontendThor:
             "subtask_logits": np.asarray(logits, dtype=np.float32),
             "predicted_stage": np.asarray(output_stage, dtype=np.int32),
             "stage": np.asarray(normalized, dtype=np.float32 if output_stage != -1 else np.int32),
-            "exist": np.asarray(exist_i, dtype=np.int32),
-            "exist_prob": np.asarray(exist_prob, dtype=np.float32),
         }
+        if use_exist_prediction:
+            result.update({
+                "exist": np.asarray(exist_i, dtype=np.int32),
+                "exist_prob": np.asarray(exist_prob, dtype=np.float32),
+            })
         debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
         debug.update({
             "condition_stage": int(self._dvt2_current_stage),
@@ -3622,6 +3656,7 @@ class Pi05JaxFrontendThor:
             "openpi_fixed_hole_rope": True,
             "prefix_nonfinite": int(prefix_nonfinite),
             "dvt2_head_gpu": True,
+            "use_exist_prediction": bool(use_exist_prediction),
         })
         result["dvt2_debug"] = debug
         self._dvt2_last_debug = debug
@@ -3657,6 +3692,8 @@ class Pi05JaxFrontendThor:
         prompt_out = np.nan_to_num(prompt_raw, nan=0.0, posinf=0.0, neginf=0.0)
         base_pooled = base_out.mean(axis=0)
         prompt_pooled = prompt_out.mean(axis=0)
+        use_exist_prediction = bool(
+            getattr(profile, "use_exist_prediction", True))
         logits = stage_logits_numpy(
             prompt_pooled,
             self._dvt2_task_category,
@@ -3664,13 +3701,16 @@ class Pi05JaxFrontendThor:
             profile,
         )
         pred_stage = int(np.argmax(logits))
-        exist_pred, exist_prob = exist_prediction_numpy(
-            base_pooled,
-            prompt_pooled,
-            self._dvt2_weights_np,
-        )
-        exist_i = int(np.asarray(exist_pred).item())
-        output_stage = -1 if exist_i == 0 else pred_stage
+        exist_i = 1
+        exist_prob = None
+        if use_exist_prediction:
+            exist_pred, exist_prob = exist_prediction_numpy(
+                base_pooled,
+                prompt_pooled,
+                self._dvt2_weights_np,
+            )
+            exist_i = int(np.asarray(exist_pred).item())
+        output_stage = -1 if use_exist_prediction and exist_i == 0 else pred_stage
         normalized = normalize_stage(output_stage, self._dvt2_task_category, profile)
         condition_stage = int(self._dvt2_current_stage)
         self._dvt2_current_stage = int(
@@ -3684,9 +3724,12 @@ class Pi05JaxFrontendThor:
             "subtask_logits": np.asarray(logits, dtype=np.float32),
             "predicted_stage": np.asarray(output_stage, dtype=np.int32),
             "stage": np.asarray(normalized, dtype=np.float32 if output_stage != -1 else np.int32),
-            "exist": np.asarray(exist_i, dtype=np.int32),
-            "exist_prob": np.asarray(exist_prob, dtype=np.float32),
         }
+        if use_exist_prediction:
+            result.update({
+                "exist": np.asarray(exist_i, dtype=np.int32),
+                "exist_prob": np.asarray(exist_prob, dtype=np.float32),
+            })
         debug = dict(getattr(self, "_dvt2_last_debug", {}) or {})
         debug.update({
             "condition_stage": int(self._dvt2_current_stage),
@@ -3700,6 +3743,7 @@ class Pi05JaxFrontendThor:
             "prefix_nonfinite": int(prefix_nonfinite),
             "base_pooled_finite": bool(np.isfinite(base_pooled).all()),
             "prompt_pooled_finite": bool(np.isfinite(prompt_pooled).all()),
+            "use_exist_prediction": bool(use_exist_prediction),
         })
         result["dvt2_debug"] = debug
         self._dvt2_last_debug = debug

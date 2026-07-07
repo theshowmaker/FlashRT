@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-mode", default="openpi_masked_fixed200",
                         choices=["bucketed", "fixed", "openpi_masked_fixed200"])
     parser.add_argument("--policy-profile", default="pi05_dvt2_fft_0605",
-                        choices=["auto", "none", "pi05_dvt2_fft_0605"])
+                        choices=["auto", "none", "pi05_dvt2_fft_0605", "pi05_dvt2_fft_0629"])
     parser.add_argument("--percentile", type=float, default=99.9)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--clear-existing", action="store_true",

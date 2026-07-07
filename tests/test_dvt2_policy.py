@@ -6,6 +6,7 @@ import torch
 
 from flash_rt.core.utils.dvt2_policy import (
     PROFILE_DVT2_0605,
+    PROFILE_DVT2_0629,
     DVT2Profile,
     clamp_h10w_dvt2_actions,
     exist_prediction_torch,
@@ -80,6 +81,16 @@ def test_resolve_policy_profile_auto_detects_dvt2_train_config(tmp_path):
     assert profile.task_categories == ("pick", "place", "give")
     assert profile.category_num_stages == (5, 5, 6)
     assert profile.stage_fusion_num_tokens == 4
+    assert profile.use_exist_prediction is True
+
+
+def test_resolve_policy_profile_auto_detects_noexist_dvt2_train_config(tmp_path):
+    _write_train_config(tmp_path, {"use_exist_prediction": False})
+    profile = resolve_policy_profile("auto", tmp_path)
+    assert profile is not None
+    assert profile.task_categories == ("pick", "place", "give")
+    assert profile.category_num_stages == (5, 5, 6)
+    assert profile.use_exist_prediction is False
 
 
 def test_resolve_policy_profile_auto_ignores_non_dvt2_config(tmp_path):
@@ -87,6 +98,7 @@ def test_resolve_policy_profile_auto_ignores_non_dvt2_config(tmp_path):
     assert resolve_policy_profile("auto", tmp_path) is None
     assert resolve_policy_profile("none", tmp_path) is None
     assert resolve_policy_profile(PROFILE_DVT2_0605, tmp_path) is not None
+    assert resolve_policy_profile(PROFILE_DVT2_0629, tmp_path).use_exist_prediction is False
 
 
 def test_task_category_and_stage_normalization_match_openpi_defaults():
@@ -176,7 +188,71 @@ def test_dvt2_weight_collection_reports_missing_keys():
 
     pipe = object.__new__(Pi05TorchFrontendRtx)
     pipe._dvt2_enabled = True
+    pipe.dvt2_profile = DVT2Profile()
     pipe._ckpt_bf16 = _fake_weights()
     assert pipe._collect_dvt2_weights() is not None
     del pipe._ckpt_bf16["stage_projection_b"]
     assert pipe._collect_dvt2_weights() is None
+
+
+def test_dvt2_noexist_weight_collection_allows_missing_exist_mlp():
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+
+    pipe = object.__new__(Pi05TorchFrontendRtx)
+    pipe._dvt2_enabled = True
+    pipe.dvt2_profile = DVT2Profile(use_exist_prediction=False)
+    pipe._ckpt_bf16 = _fake_weights()
+    for key in (
+        "exist_mlp_1_w",
+        "exist_mlp_1_b",
+        "exist_mlp_2_w",
+        "exist_mlp_2_b",
+    ):
+        del pipe._ckpt_bf16[key]
+    weights = pipe._collect_dvt2_weights()
+    assert weights is not None
+    assert "stage_mlp_1_w" in weights
+    assert "exist_mlp_1_w" not in weights
+
+
+def test_thor_dvt2_noexist_weight_collection_allows_missing_exist_mlp():
+    from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor
+
+    pipe = object.__new__(Pi05JaxFrontendThor)
+    pipe.dvt2_profile = DVT2Profile(use_exist_prediction=False)
+    weights = {k: v.numpy() for k, v in _fake_weights().items()}
+    attr_map = {
+        "_dvt2_stage_task_embed_np": "stage_task_embed",
+        "_dvt2_stage_mlp_1_w_np": "stage_mlp_1_w",
+        "_dvt2_stage_mlp_1_b_np": "stage_mlp_1_b",
+        "_dvt2_stage_mlp_2_w_np": "stage_mlp_2_w",
+        "_dvt2_stage_mlp_2_b_np": "stage_mlp_2_b",
+        "_dvt2_stage_class_embeddings_np": "stage_class_embeddings",
+        "_dvt2_task_stage_embeddings_np": "task_stage_embeddings",
+        "_dvt2_gate_sincos_w_np": "gate_sincos_w",
+        "_dvt2_gate_sincos_b_np": "gate_sincos_b",
+        "_dvt2_gate_task_stage_w_np": "gate_task_stage_w",
+        "_dvt2_gate_task_stage_b_np": "gate_task_stage_b",
+        "_dvt2_gate_task_w_np": "gate_task_w",
+        "_dvt2_gate_task_b_np": "gate_task_b",
+        "_dvt2_fusion_layer1_w_np": "fusion_layer1_w",
+        "_dvt2_fusion_layer1_b_np": "fusion_layer1_b",
+        "_dvt2_fusion_layer2_w_np": "fusion_layer2_w",
+        "_dvt2_fusion_layer2_b_np": "fusion_layer2_b",
+        "_dvt2_stage_projection_w_np": "stage_projection_w",
+        "_dvt2_stage_projection_b_np": "stage_projection_b",
+    }
+    for attr, key in attr_map.items():
+        setattr(pipe, attr, weights[key])
+    for attr in (
+        "_dvt2_exist_mlp_1_w_np",
+        "_dvt2_exist_mlp_1_b_np",
+        "_dvt2_exist_mlp_2_w_np",
+        "_dvt2_exist_mlp_2_b_np",
+    ):
+        setattr(pipe, attr, np.empty((0,), dtype=np.float32))
+
+    collected = pipe._collect_dvt2_weights_np()
+    assert collected is not None
+    assert "stage_mlp_1_w" in collected
+    assert "exist_mlp_1_w" not in collected

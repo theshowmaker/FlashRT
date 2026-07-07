@@ -53,7 +53,6 @@ from flash_rt.frontends.torch.pi05_rtx import (
 from flash_rt.core.utils.hardware import supports_fp8
 from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN
 from flash_rt.core.utils.dvt2_policy import (
-    PROFILE_DVT2_0605,
     DVT2Profile,
     resolve_policy_profile,
 )
@@ -505,7 +504,11 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         )
         self._dvt2_enabled = self.dvt2_profile is not None
         if self._dvt2_enabled:
-            logger.info("Enabled Pi0.5 DVT2 policy profile (%s)", PROFILE_DVT2_0605)
+            logger.info(
+                "Enabled Pi0.5 DVT2 policy profile (%s, exist=%s)",
+                self.policy_profile_name,
+                bool(getattr(self.dvt2_profile, "use_exist_prediction", True)),
+            )
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)

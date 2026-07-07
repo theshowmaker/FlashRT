@@ -64,3 +64,40 @@ python examples/pi05_websocket_policy_server.py \
   --robot-type dvt2 \
   --host 0.0.0.0 \
   --port 8001
+
+# check
+
+.venv/bin/python examples/compare_openpi_flashrt_outputs.py   --openpi-host 127.0.0.1   --openpi-port 8000   --flashrt-host 10.8.24.114   --flashrt-port 8001   --obs-glob "tmp/0603_dvt2_sofa_episode_000000_obs_npz/*.npz"   --steps 157   --require-action-shape 50,16   --require-exist-match   --require-stage-match   --summary-skip 1   --no-early-fail   --save tmp/openpi_vs_flashrt_79999_robot_obs_nodebug.npz
+
+.venv/bin/python examples/compare_openpi_flashrt_outputs.py   --openpi-host 127.0.0.1   --openpi-port 8000   --flashrt-host 10.8.24.183   --flashrt-port 8001   --obs-glob "tmp/robot_obs_record/*.npz"   --steps 19   --require-action-shape 50,16   --require-exist-match   --require-stage-match   --summary-skip 1   --no-early-fail   --save tmp/openpi_vs_flashrt_79999_robot_obs_nodebug.npz
+
+
+
+# 0704 models
+rsync -av --delete   --exclude .git   --exclude .venv   --exclude build   --exclude '*.so'   --exclude '__pycache__'   --exclude tmp   --exclude .agents   --exclude .codex   /home/peng.song/vla/FlashRT/   diana@10.8.26.61:~/vla/FlashRT/
+
+peng.song@ubuntu-22-peng-song:/home/peng.song/ksyun_server/models/dvt2$ rsync -av --exclude='train_state' peng@120.92.116.251:/DATA/disk0/yuhao.song/checkpoints/pi05_dvt2_fft_0704/0704_dvt2_all/50000 ./0704_dvt2_all/
+
+peng.song@ubuntu-22-peng-song:/home/peng.song/ksyun_server/models/dvt2$ rsync -av --progress ./0704_dvt2_all  diana@10.8.26.61:~/vla/models/
+
+rsync -av --progress  peng@120.92.116.251:~/peng.song/high-level-policy/tmp4FlashRT/tmp/0704_all_calib_obs ~/vla/FlashRT/tmp/
+
+rsync -av --progress /home/peng.song/vla/FlashRT/tmp/0704_all_calib_obs   diana@10.8.26.61:~/vla/FlashRT/tmp/
+
+
+
+(.venv) diana@localhost:~/vla/FlashRT$ CUDA_VISIBLE_DEVICES=0 python examples/pi05_thor_offline_calibrate.py   --checkpoint ~/vla/models/0704_dvt2_all/50000   --obs-glob "tmp/0704_all_calib_obs/*.npz"   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile auto   --percentile 99.9   --max-samples 256   --clear-existing   --verbose
+
+(.venv) diana@localhost:~/vla/FlashRT$ CUDA_VISIBLE_DEVICES=0 python examples/pi05_websocket_policy_server.py   --checkpoint ~/vla/models/0704_dvt2_all/50000   --framework jax   --hardware thor   --num-views 3   --chunk-size 50   --prompt-mode openpi_masked_fixed200   --fixed-state-prompt-len 200   --policy-profile auto   --robot-type dvt2   --host 0.0.0.0   --port 8001   --log-infer-ms
+
+peng.song@ubuntu-22-peng-song:/home/peng.song/vla/openpi$ CUDA_VISIBLE_DEVICES=1 uv run scripts/serve_policy.py   --env H10W_DUAL3   --port 8000
+
+
+
+
+
+python examples/compare_openpi_flashrt_outputs.py   --openpi-host 127.0.0.1   --openpi-port 8000   --flashrt-host 10.8.26.61   --flashrt-port 8001   --obs-glob "tmp/robot_obs_record/*.npz"   --require-action-shape 50,16   --require-stage-match   --summary-skip 1   --no-early-fail   --save tmp/openpi_vs_flashrt_thor_0629_compare_full.npz --steps 19
+
+
+python examples/compare_openpi_flashrt_outputs.py   --openpi-host 127.0.0.1   --openpi-port 8000   --flashrt-host 10.8.26.61   --flashrt-port 8001   --obs-glob "tmp/0603_dvt2_sofa_episode_000000_obs_npz/*.npz"   --require-action-shape 50,16   --require-stage-match   --summary-skip 1   --no-early-fail   --save tmp/openpi_vs_flashrt_thor_0629_compare_full.npz --steps 157
+

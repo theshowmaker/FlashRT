@@ -20,6 +20,8 @@ import numpy as np
 PROFILE_NONE = "none"
 PROFILE_AUTO = "auto"
 PROFILE_DVT2_0605 = "pi05_dvt2_fft_0605"
+PROFILE_DVT2_0629 = "pi05_dvt2_fft_0629"
+PROFILE_DVT2_ALIASES = (PROFILE_DVT2_0605, PROFILE_DVT2_0629)
 
 
 @dataclass(frozen=True)
@@ -29,9 +31,11 @@ class DVT2Profile:
     stage_fusion_num_tokens: int = 4
     max_num_stages: int = 6
     include_no_action_stage: bool = False
+    use_exist_prediction: bool = True
 
 
 DVT2_DEFAULT_PROFILE = DVT2Profile()
+DVT2_NO_EXIST_PROFILE = DVT2Profile(use_exist_prediction=False)
 
 
 LEFT_ARM_JOINT_LIMITS = np.array(
@@ -112,8 +116,7 @@ def profile_from_train_config(config: Mapping[str, Any] | None) -> DVT2Profile |
         model.get("use_stage_prediction"),
         model.get("use_stage_fusion"),
         model.get("use_stage_tracking"),
-        model.get("use_exist_prediction"),
-        model.get("use_exist_mlp"),
+        model.get("use_stage_mlp"),
     )
     if not all(bool(x) for x in required):
         return None
@@ -129,6 +132,7 @@ def profile_from_train_config(config: Mapping[str, Any] | None) -> DVT2Profile |
         stage_fusion_num_tokens=int(model.get("stage_fusion_num_tokens", 4)),
         max_num_stages=max(max_stages, max(counts)),
         include_no_action_stage=bool(model.get("include_no_action_stage", False)),
+        use_exist_prediction=bool(model.get("use_exist_prediction", False)),
     )
 
 
@@ -139,12 +143,18 @@ def resolve_policy_profile(
     requested = str(requested or PROFILE_AUTO)
     if requested == PROFILE_NONE:
         return None
-    if requested == PROFILE_DVT2_0605:
-        return profile_from_train_config(load_train_config(checkpoint_dir)) or DVT2_DEFAULT_PROFILE
+    if requested in PROFILE_DVT2_ALIASES:
+        fallback = (
+            DVT2_NO_EXIST_PROFILE
+            if requested == PROFILE_DVT2_0629
+            else DVT2_DEFAULT_PROFILE
+        )
+        return profile_from_train_config(load_train_config(checkpoint_dir)) or fallback
     if requested != PROFILE_AUTO:
         raise ValueError(
             f"policy_profile must be one of "
-            f"{PROFILE_AUTO!r}, {PROFILE_NONE!r}, {PROFILE_DVT2_0605!r}; got {requested!r}"
+            f"{PROFILE_AUTO!r}, {PROFILE_NONE!r}, "
+            f"{PROFILE_DVT2_0605!r}, {PROFILE_DVT2_0629!r}; got {requested!r}"
         )
     return profile_from_train_config(load_train_config(checkpoint_dir))
 
