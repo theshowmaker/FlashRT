@@ -316,6 +316,7 @@ def _sample_frames(
     count: int,
     max_episodes_per_task: int,
     seed: int,
+    category_counts: dict[str, int] | None = None,
 ) -> list[tuple[Episode, int]]:
     rng = np.random.default_rng(seed)
     by_task: dict[int, list[Episode]] = defaultdict(list)
@@ -328,9 +329,32 @@ def _sample_frames(
     if not tasks:
         raise RuntimeError("no non-empty episodes to sample")
 
-    per_task = {task: count // len(tasks) for task in tasks}
-    for task in tasks[:count % len(tasks)]:
-        per_task[task] += 1
+    if category_counts:
+        per_task: dict[int, int] = {}
+        tasks_by_category: dict[str, list[int]] = defaultdict(list)
+        task_names = {task: by_task[task][0].task_name for task in by_task}
+        for task in tasks:
+            tasks_by_category[_task_category(task_names[task])].append(task)
+
+        for category, target in category_counts.items():
+            category_tasks = list(tasks_by_category.get(category, []))
+            if target <= 0:
+                continue
+            if not category_tasks:
+                logger.warning(
+                    "Requested %d samples for category %r, but no tasks were found",
+                    target, category)
+                continue
+            rng.shuffle(category_tasks)
+            for task in category_tasks:
+                per_task[task] = per_task.get(task, 0) + target // len(category_tasks)
+            for task in category_tasks[:target % len(category_tasks)]:
+                per_task[task] = per_task.get(task, 0) + 1
+        count = sum(per_task.values())
+    else:
+        per_task = {task: count // len(tasks) for task in tasks}
+        for task in tasks[:count % len(tasks)]:
+            per_task[task] += 1
 
     samples: list[tuple[Episode, int]] = []
     for task in tasks:
@@ -379,6 +403,55 @@ def _sample_frames(
     return samples
 
 
+def _task_category(task_name: str) -> str:
+    task = task_name.strip().lower()
+    if task.startswith("give") or " give " in f" {task} ":
+        return "give"
+    if task.startswith("place"):
+        return "place"
+    if task.startswith("pick") or task.startswith("ick"):
+        return "pick"
+    return "other"
+
+
+def _parse_category_counts(value: str | None) -> dict[str, int] | None:
+    if not value:
+        return None
+    out: dict[str, int] = {}
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(
+                f"invalid --category-counts item {part!r}; expected name=count")
+        name, raw_count = part.split("=", 1)
+        name = name.strip().lower()
+        count = int(raw_count.strip())
+        if count < 0:
+            raise ValueError(f"category count must be non-negative, got {part!r}")
+        out[name] = count
+    return out or None
+
+
+def _balanced_category_counts(
+    episodes: list[Episode],
+    *,
+    count: int,
+) -> dict[str, int]:
+    categories = sorted({
+        _task_category(ep.task_name)
+        for ep in episodes
+        if ep.length > 0
+    })
+    if not categories:
+        raise RuntimeError("no non-empty categories to sample")
+    per_category = {category: count // len(categories) for category in categories}
+    for category in categories[:count % len(categories)]:
+        per_category[category] += 1
+    return per_category
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", type=Path, required=True)
@@ -391,6 +464,10 @@ def parse_args() -> argparse.Namespace:
                    help="Source state column. Auto-detected from meta/info.json by default.")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--max-episodes-per-task", type=int, default=8)
+    p.add_argument("--balance-by-category", action="store_true",
+                   help="Split --count evenly across prompt categories such as pick/give/place, then balance tasks inside each category.")
+    p.add_argument("--category-counts", default=None,
+                   help="Explicit category quotas, e.g. pick=192,give=128,place=128. Overrides --count total.")
     p.add_argument("--require-state-dim", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dry-run", action="store_true")
@@ -415,11 +492,18 @@ def main() -> int:
     logger.info("dataset=%s episodes=%d tasks=%d", root, len(episodes), len({e.task_index for e in episodes}))
     logger.info("image_keys=%s state_key=%s", image_keys, state_key)
 
+    category_counts = _parse_category_counts(args.category_counts)
+    if args.balance_by_category and category_counts is None:
+        category_counts = _balanced_category_counts(episodes, count=args.count)
+    if category_counts:
+        logger.info("category_counts=%s", category_counts)
+
     planned_pairs = _sample_frames(
         episodes,
         count=args.count,
         max_episodes_per_task=max(1, args.max_episodes_per_task),
         seed=args.seed,
+        category_counts=category_counts,
     )
     samples: list[Sample] = []
     for ep, frame in planned_pairs:
@@ -444,14 +528,19 @@ def main() -> int:
         "image_size": args.image_size,
         "seed": args.seed,
         "max_episodes_per_task": args.max_episodes_per_task,
+        "category_counts": category_counts,
         "entries": [],
     }
 
     if args.dry_run:
         by_task = defaultdict(int)
+        by_category = defaultdict(int)
         for sample in samples:
             by_task[sample.episode.task_index] += 1
+            by_category[_task_category(sample.episode.task_name)] += 1
         logger.info("dry run: selected %d samples over %d tasks", len(samples), len(by_task))
+        for category, n in sorted(by_category.items()):
+            logger.info("  category %s: %d samples", category, n)
         for task_index, n in sorted(by_task.items()):
             logger.info("  task %s: %d samples prompt=%r", task_index, n, tasks.get(task_index, ""))
         return 0

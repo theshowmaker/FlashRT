@@ -427,6 +427,8 @@ CUDA_VISIBLE_DEVICES=0 python examples/pi05_thor_offline_calibrate.py   --checkp
 
 (hl-policy) peng@10-0-1-180:~/peng.song/high-level-policy/tmp4FlashRT$ python tmp4FlashRT/extract_lerobot_calib_obs.py   --dataset /DATA/disk0/huggingface/lerobot/0629_all   --out-dir tmp/0629_all_calib_obs   --count 256   --num-views 3   --require-state-dim 16   --max-episodes-per-task 8   --seed 0   --overwrite
 
+(hl-policy) peng@10-0-1-180:~/peng.song/high-level-policy$ python tmp4FlashRT/extract_lerobot_calib_obs.py   --dataset /DATA/disk0/huggingface/lerobot/0704_all_clean   --out-dir ./tmp4FlashRT/tmp/0704_all_calib_obs_balanced_512   --num-views 3   --require-state-dim 16   --category-counts pick=256,give=128,place=128   --max-episodes-per-task 32   --seed 0   --overwrite
+
 # launch from a certain thor
 
 cd ~/vla/FlashRT
@@ -446,3 +448,82 @@ python examples/pi05_websocket_policy_server.py \
 
 
 --checkpoint ~/vla/models/0629_dvt2_all/78000
+
+
+
+
+# clear model cache
+cd ~/vla/FlashRT
+source .venv/bin/activate
+
+python - <<'PY'
+from flash_rt.core.quant.calibrator import clear_calibration
+from flash_rt.core.weights.weight_cache import clear_weight_cache
+
+ckpt = "/home/diana/vla/models/0629_dvt2_all/89999"
+clear_calibration(ckpt)
+clear_weight_cache(ckpt)
+print("cleared", ckpt)
+PY
+
+
+
+# notes
+1. 
+是的，当前这版改动是**兼容旧有 config** 的，尤其是 `pi05_dvt2_fft_0605` / 你之前的 0617 这类 `use_exist_prediction=True` 模型。
+
+我刚又跑了一遍相关测试：
+
+```text
+12 passed
+```
+
+兼容性具体体现在：
+
+- `pi05_dvt2_fft_0605` 强制 profile 仍然 fallback 到 `DVT2_DEFAULT_PROFILE`，其中：
+  ```python
+  use_exist_prediction=True
+  ```
+- 如果旧 checkpoint 的 `train_config_full.json` 里有：
+  ```python
+  use_exist_prediction=True
+  ```
+  `auto` 解析出来也仍是 `True`。
+- 对旧模型，`exist_mlp_*` 仍然是 required；缺了还是会报错，不会悄悄降级。
+- 对旧模型，推理输出仍然包含：
+  ```text
+  exist
+  exist_prob
+  subtask_logits
+  predicted_stage
+  stage
+  ```
+- 对旧模型，exist gate 逻辑仍保留：
+  ```text
+  exist=0 -> predicted_stage/output_stage = -1
+  exist=0 -> action 清零
+  ```
+- 只在 `use_exist_prediction=False` 的 0629 profile 下，才会跳过 exist head、不返回 `exist/exist_prob`、不做 exist gate。
+
+所以旧配置行为应该不变。真正需要注意的是：如果某个旧 checkpoint 的 `train_config_full.json` 缺失，但你显式传：
+
+```bash
+--policy-profile pi05_dvt2_fft_0605
+```
+
+仍会按旧有 exist 模型处理；如果显式传：
+
+```bash
+--policy-profile pi05_dvt2_fft_0629
+```
+
+才会按 no-exist 模型处理。
+
+你可以用旧 0605/0617 再跑一遍 compare，命令里保留：
+
+```bash
+--require-exist-match
+--require-stage-match
+```
+
+这就是最直接的回归验收。
