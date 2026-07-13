@@ -171,6 +171,66 @@ void gate_silu_mul_merged_fp16(const __half* merged, __half* out,
     gate_silu_mul_merged_kernel<__half><<<blocks, 256, 0, stream>>>(merged, out, seq, half_dim);
 }
 
+// Calibration-only FP32 amax path.  Production already evaluates GeGLU in
+// FP32 registers and writes FP8 directly (see
+// gate_silu_mul_merged_fp8_kernel_fp16 below).  Materializing GeGLU as FP16
+// before measuring it can overflow at deep layers even though the value is
+// representable by FP8 after applying its static scale.
+__global__ void measure_gate_geglu_amax_fp16_kernel(
+        const __half* __restrict__ merged, float* __restrict__ d_amax,
+        int seq, int half_dim) {
+    extern __shared__ float shared[];
+    const int total = seq * half_dim;
+    float local_max = 0.0f;
+
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += gridDim.x * blockDim.x) {
+        const int row = idx / half_dim;
+        const int col = idx - row * half_dim;
+        const int base = row * (half_dim * 2);
+        const float g = __half2float(merged[base + col]);
+        const float u = __half2float(merged[base + half_dim + col]);
+        // Keep this expression identical to the production FP8 kernel.
+        const float gelu = g / (1.0f + __expf(
+            -1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+        local_max = fmaxf(local_max, fabsf(gelu * u));
+    }
+
+    local_max = warp_reduce_max(local_max);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) shared[warp] = local_max;
+    __syncthreads();
+
+    const int num_warps = (blockDim.x + 31) >> 5;
+    local_max = (threadIdx.x < num_warps) ? shared[threadIdx.x] : 0.0f;
+    if (warp == 0) local_max = warp_reduce_max(local_max);
+    if (threadIdx.x == 0) {
+        // All values are non-negative, so integer atomicMax preserves float
+        // ordering (including +inf, which intentionally remains visible).
+        atomicMax(reinterpret_cast<int*>(d_amax), __float_as_int(local_max));
+    }
+}
+
+__global__ void finalize_gate_geglu_scale_kernel(float* d_scale) {
+    float scale = *d_scale / 448.0f;
+    if (scale < 1e-12f) scale = 1e-12f;
+    *d_scale = scale;
+}
+
+void measure_gate_geglu_scale_fp16(const __half* merged, float* d_scale,
+                                    int seq, int half_dim,
+                                    cudaStream_t stream) {
+    cudaMemsetAsync(d_scale, 0, sizeof(float), stream);
+    constexpr int threads = 256;
+    int blocks = (seq * half_dim + threads - 1) / threads;
+    if (blocks > 1024) blocks = 1024;
+    measure_gate_geglu_amax_fp16_kernel<<<
+        blocks, threads, (threads / 32) * sizeof(float), stream>>>(
+            merged, d_scale, seq, half_dim);
+    finalize_gate_geglu_scale_kernel<<<1, 1, 0, stream>>>(d_scale);
+}
+
 // Vectorized 8-half / thread element-wise multiply.  BW-bound; pairs
 // with two split-G7 GEMMs in R3.1 to replace gate_silu_mul_merged_fp16.
 __global__ void mul_fp16_kernel(const __half* __restrict__ a,

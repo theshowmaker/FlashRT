@@ -778,9 +778,11 @@ def encoder_forward_calibrate(gemm, fvk_mod, bufs, weights, dims,
             fvk_mod.cutlass_fp8_t1(x_fp8, weights['gate_w'][l], gate,
                                     Se, H * 2, D, alpha_gu, 0.0, stream)
 
-            # 9. GELU FP16 → measure → FP8
-            fvk_mod.gate_geglu_merged_fp16(gate, hidden, Se, H, stream)
-            _measure_scale_gpu(fvk_mod, hidden, Se * H, d_scale, fp8_scratch, stream)
+            # 9. Measure GELU(gate) * up in FP32, then produce FP8 directly.
+            # Materializing the product in FP16 can overflow in deep layers
+            # (notably scale 71), while inference itself evaluates GeGLU in
+            # FP32 registers before quantizing to FP8.
+            fvk_mod.measure_gate_geglu_scale_fp16(gate, d_scale, Se, H, stream)
             _gpu_sync(stream)
             as_down = _d2h_float(d_scale)
             cs_down = calib_buf + (l * 4 + 3) * 4
